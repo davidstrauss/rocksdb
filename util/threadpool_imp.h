@@ -90,12 +90,12 @@ class ThreadPoolImpl : public ThreadPool {
   int total_threads_limit_;
 
 #ifdef ROCKSDB_STD_THREADPOOL
-  std::mutex mu_;
-  std::condition_variable bgsignal_;
+  std::mutex* mu_;
+  std::condition_variable* bgsignal_;
   std::vector<std::thread> bgthreads_;
 #else
-  pthread_mutex_t mu_;
-  pthread_cond_t bgsignal_;
+  pthread_mutex_t* mu_;
+  pthread_cond_t* bgsignal_;
   std::vector<pthread_t> bgthreads_;
 #endif
   BGQueue queue_;

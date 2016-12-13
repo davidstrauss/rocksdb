@@ -16,12 +16,15 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/time.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #include <cstdlib>
 #include "util/logging.h"
+//#include "rocksdb/env.h"
 
 namespace rocksdb {
 namespace port {
@@ -36,27 +39,42 @@ static int PthreadCall(const char* label, int result) {
 
 Mutex::Mutex(bool adaptive) {
 #ifdef ROCKSDB_PTHREAD_ADAPTIVE_MUTEX
-  if (!adaptive) {
-    PthreadCall("init mutex", pthread_mutex_init(&mu_, nullptr));
-  } else {
-    pthread_mutexattr_t mutex_attr;
-    PthreadCall("init mutex attr", pthread_mutexattr_init(&mutex_attr));
+  pthread_mutexattr_t mutex_attr;
+  char fd_template[] = "/tmp/port_posix_mutex.XXXXXX";
+  //int zfd = open("/tmp/port_posix_mutex.XXXXXX", O_RDWR | O_CREAT, 0666);
+  //int zfd = open("/dev/zero", O_RDWR);
+  int zfd = mkstemp(fd_template);
+  posix_fallocate(zfd, 0, sizeof(pthread_mutex_t));
+  mu_ = (pthread_mutex_t*) mmap(0, sizeof(pthread_mutex_t), PROT_READ | PROT_WRITE, MAP_SHARED, zfd, 0);
+  close(zfd);
+  //mu_ = (pthread_mutex_t*) mmap(NULL, sizeof(pthread_mutex_t), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+
+  PthreadCall("init mutex attr", pthread_mutexattr_init(&mutex_attr));
+  PthreadCall("set mutex pshared",
+              pthread_mutexattr_setpshared(&mutex_attr,
+                                           PTHREAD_PROCESS_SHARED));
+  if (adaptive) {
     PthreadCall("set mutex attr",
                 pthread_mutexattr_settype(&mutex_attr,
                                           PTHREAD_MUTEX_ADAPTIVE_NP));
-    PthreadCall("init mutex", pthread_mutex_init(&mu_, &mutex_attr));
-    PthreadCall("destroy mutex attr",
-                pthread_mutexattr_destroy(&mutex_attr));
   }
+
+  //int fd = open("/tmp/test_write.XXXXXX", O_RDWR | O_CREAT, 0666);
+  //write(fd, "hello\n", 6);
+  //close(fd);
+  //Log(InfoLogLevel::INFO_LEVEL, db_options_->info_log, "Created process-safe locks.");
+
+  PthreadCall("init mutex", pthread_mutex_init(mu_, &mutex_attr));
+  PthreadCall("destroy mutex attr", pthread_mutexattr_destroy(&mutex_attr));
 #else
-  PthreadCall("init mutex", pthread_mutex_init(&mu_, nullptr));
+  PthreadCall("init mutex", pthread_mutex_init(mu_, nullptr));
 #endif // ROCKSDB_PTHREAD_ADAPTIVE_MUTEX
 }
 
-Mutex::~Mutex() { PthreadCall("destroy mutex", pthread_mutex_destroy(&mu_)); }
+Mutex::~Mutex() { PthreadCall("destroy mutex", pthread_mutex_destroy(mu_)); }
 
 void Mutex::Lock() {
-  PthreadCall("lock", pthread_mutex_lock(&mu_));
+  PthreadCall("lock", pthread_mutex_lock(mu_));
 #ifndef NDEBUG
   locked_ = true;
 #endif
@@ -66,7 +84,7 @@ void Mutex::Unlock() {
 #ifndef NDEBUG
   locked_ = false;
 #endif
-  PthreadCall("unlock", pthread_mutex_unlock(&mu_));
+  PthreadCall("unlock", pthread_mutex_unlock(mu_));
 }
 
 void Mutex::AssertHeld() {
@@ -77,16 +95,38 @@ void Mutex::AssertHeld() {
 
 CondVar::CondVar(Mutex* mu)
     : mu_(mu) {
-    PthreadCall("init cv", pthread_cond_init(&cv_, nullptr));
+
+    pthread_condattr_t cvar_attr;
+
+    // Map concurrency primitives to memory accessible across process boundaries.
+    //int zfd = open("/tmp/port_posix_cvar.XXXXXX", O_RDWR | O_CREAT, 0666);
+    char fd_template[] = "/tmp/port_posix_cvar.XXXXXX";
+    //int zfd = open("/dev/zero", O_RDWR);
+    int zfd = mkstemp(fd_template);
+    posix_fallocate(zfd, 0, sizeof(pthread_cond_t));
+
+    cv_ = (pthread_cond_t*) mmap(0, sizeof(pthread_cond_t), PROT_READ | PROT_WRITE, MAP_SHARED, zfd, 0);
+    //cv_ = (pthread_cond_t*) mmap(NULL, sizeof(pthread_cond_t), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+    close(zfd);
+
+    // Initialize a process-sharable condition variable.
+    PthreadCall("init cvar attr", pthread_condattr_init(&cvar_attr));
+    PthreadCall("set cvar pshared",
+                pthread_condattr_setpshared(&cvar_attr, PTHREAD_PROCESS_SHARED));
+    PthreadCall("init cvar", pthread_cond_init(cv_, &cvar_attr));
+    PthreadCall("destroy cvar attr", pthread_condattr_destroy(&cvar_attr));
+
+
+    //PthreadCall("init cv", pthread_cond_init(cv_, nullptr));
 }
 
-CondVar::~CondVar() { PthreadCall("destroy cv", pthread_cond_destroy(&cv_)); }
+CondVar::~CondVar() { PthreadCall("destroy cv", pthread_cond_destroy(cv_)); }
 
 void CondVar::Wait() {
 #ifndef NDEBUG
   mu_->locked_ = false;
 #endif
-  PthreadCall("wait", pthread_cond_wait(&cv_, &mu_->mu_));
+  PthreadCall("wait", pthread_cond_wait(cv_, mu_->mu_));
 #ifndef NDEBUG
   mu_->locked_ = true;
 #endif
@@ -100,7 +140,7 @@ bool CondVar::TimedWait(uint64_t abs_time_us) {
 #ifndef NDEBUG
   mu_->locked_ = false;
 #endif
-  int err = pthread_cond_timedwait(&cv_, &mu_->mu_, &ts);
+  int err = pthread_cond_timedwait(cv_, mu_->mu_, &ts);
 #ifndef NDEBUG
   mu_->locked_ = true;
 #endif
@@ -114,26 +154,26 @@ bool CondVar::TimedWait(uint64_t abs_time_us) {
 }
 
 void CondVar::Signal() {
-  PthreadCall("signal", pthread_cond_signal(&cv_));
+  PthreadCall("signal", pthread_cond_signal(cv_));
 }
 
 void CondVar::SignalAll() {
-  PthreadCall("broadcast", pthread_cond_broadcast(&cv_));
+  PthreadCall("broadcast", pthread_cond_broadcast(cv_));
 }
 
 RWMutex::RWMutex() {
-  PthreadCall("init mutex", pthread_rwlock_init(&mu_, nullptr));
+  PthreadCall("init mutex", pthread_rwlock_init(mu_, nullptr));
 }
 
-RWMutex::~RWMutex() { PthreadCall("destroy mutex", pthread_rwlock_destroy(&mu_)); }
+RWMutex::~RWMutex() { PthreadCall("destroy mutex", pthread_rwlock_destroy(mu_)); }
 
-void RWMutex::ReadLock() { PthreadCall("read lock", pthread_rwlock_rdlock(&mu_)); }
+void RWMutex::ReadLock() { PthreadCall("read lock", pthread_rwlock_rdlock(mu_)); }
 
-void RWMutex::WriteLock() { PthreadCall("write lock", pthread_rwlock_wrlock(&mu_)); }
+void RWMutex::WriteLock() { PthreadCall("write lock", pthread_rwlock_wrlock(mu_)); }
 
-void RWMutex::ReadUnlock() { PthreadCall("read unlock", pthread_rwlock_unlock(&mu_)); }
+void RWMutex::ReadUnlock() { PthreadCall("read unlock", pthread_rwlock_unlock(mu_)); }
 
-void RWMutex::WriteUnlock() { PthreadCall("write unlock", pthread_rwlock_unlock(&mu_)); }
+void RWMutex::WriteUnlock() { PthreadCall("write unlock", pthread_rwlock_unlock(mu_)); }
 
 int PhysicalCoreID() {
 #if defined(__i386__) || defined(__x86_64__)

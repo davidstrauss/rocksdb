@@ -31,6 +31,7 @@
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/table.h"
 #include "rocksdb/rate_limiter.h"
+#include "rocksdb/utilities/db_ttl.h"
 #include "rocksdb/utilities/backupable_db.h"
 #include "utilities/merge_operators.h"
 
@@ -47,6 +48,7 @@ using rocksdb::CompressionType;
 using rocksdb::WALRecoveryMode;
 using rocksdb::DB;
 using rocksdb::DBOptions;
+using rocksdb::DBWithTTL;
 using rocksdb::Env;
 using rocksdb::EnvOptions;
 using rocksdb::InfoLogLevel;
@@ -430,6 +432,21 @@ rocksdb_t* rocksdb_open(
   return result;
 }
 
+rocksdb_t* rocksdb_open_with_ttl(
+    const rocksdb_options_t* options,
+    const char* name,
+    int32_t ttl,
+    unsigned char read_only,
+    char** errptr) {
+  DBWithTTL* db;
+  if (SaveError(errptr, DBWithTTL::Open(options->rep, std::string(name), &db, ttl, read_only))) {
+    return nullptr;
+  }
+  rocksdb_t* result = new rocksdb_t;
+  result->rep = db;
+  return result;
+}
+
 rocksdb_t* rocksdb_open_for_read_only(
     const rocksdb_options_t* options,
     const char* name,
@@ -542,13 +559,14 @@ void rocksdb_options_set_uint64add_merge_operator(rocksdb_options_t* opt) {
   opt->rep.merge_operator = rocksdb::MergeOperators::CreateUInt64AddOperator();
 }
 
-rocksdb_t* rocksdb_open_column_families(
+rocksdb_t* rocksdb_open_column_families_with_ttl(
     const rocksdb_options_t* db_options,
     const char* name,
     int num_column_families,
     const char** column_family_names,
     const rocksdb_options_t** column_family_options,
     rocksdb_column_family_handle_t** column_family_handles,
+    const int* ttls,
     char** errptr) {
   std::vector<ColumnFamilyDescriptor> column_families;
   for (int i = 0; i < num_column_families; i++) {
@@ -559,8 +577,20 @@ rocksdb_t* rocksdb_open_column_families(
 
   DB* db;
   std::vector<ColumnFamilyHandle*> handles;
-  if (SaveError(errptr, DB::Open(DBOptions(db_options->rep),
-          std::string(name), column_families, &handles, &db))) {
+  std::vector<int32_t> ttls_v;
+  bool open_error;
+
+  if (ttls == nullptr) {
+    open_error = SaveError(errptr, DB::Open(DBOptions(db_options->rep),
+                           std::string(name), column_families, &handles, &db));
+  } else {
+    ttls_v.assign(ttls, ttls + num_column_families);
+    open_error = SaveError(errptr, DBWithTTL::Open(DBOptions(db_options->rep),
+                           std::string(name), column_families, &handles,
+                           (DBWithTTL**) &db, ttls_v));
+  }
+
+  if (open_error) {
     return nullptr;
   }
 
@@ -572,6 +602,22 @@ rocksdb_t* rocksdb_open_column_families(
   rocksdb_t* result = new rocksdb_t;
   result->rep = db;
   return result;
+}
+
+rocksdb_t* rocksdb_open_column_families(
+    const rocksdb_options_t* db_options,
+    const char* name,
+    int num_column_families,
+    const char** column_family_names,
+    const rocksdb_options_t** column_family_options,
+    rocksdb_column_family_handle_t** column_family_handles,
+    char** errptr) {
+  return rocksdb_open_column_families_with_ttl(db_options, name,
+                                               num_column_families,
+                                               column_family_names,
+                                               column_family_options,
+                                               column_family_handles, nullptr,
+                                               errptr);
 }
 
 rocksdb_t* rocksdb_open_for_read_only_column_families(
@@ -641,6 +687,21 @@ rocksdb_column_family_handle_t* rocksdb_create_column_family(
   SaveError(errptr,
       db->rep->CreateColumnFamily(ColumnFamilyOptions(column_family_options->rep),
         std::string(column_family_name), &(handle->rep)));
+  return handle;
+}
+
+rocksdb_column_family_handle_t* rocksdb_create_column_family_with_ttl(
+    rocksdb_t* db,
+    const rocksdb_options_t* column_family_options,
+    const char* column_family_name,
+    int ttl,
+    char** errptr) {
+  rocksdb_column_family_handle_t* handle = new rocksdb_column_family_handle_t;
+  DBWithTTL* rep_w_ttl = (DBWithTTL*) db->rep;
+  SaveError(errptr,
+      rep_w_ttl->CreateColumnFamilyWithTtl(
+          ColumnFamilyOptions(column_family_options->rep),
+          std::string(column_family_name), &(handle->rep), ttl));
   return handle;
 }
 

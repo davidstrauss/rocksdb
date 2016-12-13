@@ -10,6 +10,8 @@
 #include "util/threadpool_imp.h"
 #include <algorithm>
 #include <atomic>
+#include <sys/mman.h>
+#include <fcntl.h>
 
 #ifndef OS_WIN
 #  include <unistd.h>
@@ -133,19 +135,56 @@ ThreadPoolImpl::ThreadPoolImpl()
       low_io_priority_(false),
       env_(nullptr) {
 #ifndef ROCKSDB_STD_THREADPOOL
-  PthreadCall("mutex_init", pthread_mutex_init(&mu_, nullptr));
-  PthreadCall("cvar_init", pthread_cond_init(&bgsignal_, nullptr));
+  pthread_mutexattr_t mutex_attr;
+  pthread_condattr_t cvar_attr;
+
+  // Map concurrency primitives to memory accessible across process boundaries.
+  int zfd;
+  char fd_mutex_template[] = "/tmp/threadpool_mutex.XXXXXX";
+  char fd_cvar_template[] = "/tmp/threadpool_cvar.XXXXXX";
+  //zfd = open("/dev/zero", O_RDWR);
+  zfd = mkstemp(fd_mutex_template);
+  //zfd = open("/tmp/threadpool_mutex.XXXXXX", O_RDWR | O_CREAT, 0666);
+  posix_fallocate(zfd, 0, sizeof(pthread_mutex_t));
+  mu_ = (pthread_mutex_t*) mmap(0, sizeof(pthread_mutex_t), PROT_READ | PROT_WRITE, MAP_SHARED, zfd, 0);
+  close(zfd);
+  //mu_ = (pthread_mutex_t*) mmap(NULL, sizeof(pthread_mutex_t), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+
+  //zfd = open("/dev/zero", O_RDWR);
+  zfd = mkstemp(fd_cvar_template);
+  //zfd = open("/tmp/threadpool_cvar.XXXXXX", O_RDWR | O_CREAT, 0666);
+  posix_fallocate(zfd, 0, sizeof(pthread_cond_t));
+  bgsignal_ = (pthread_cond_t*) mmap(0, sizeof(pthread_cond_t), PROT_READ | PROT_WRITE, MAP_SHARED, zfd, 0);
+  close(zfd);
+  //bgsignal_ = (pthread_cond_t*) mmap(NULL, sizeof(pthread_cond_t), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+
+  // Initialize a process-sharable mutex.
+  PthreadCall("init mutex attr", pthread_mutexattr_init(&mutex_attr));
+  PthreadCall("set mutex pshared",
+              pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED));
+  PthreadCall("init mutex", pthread_mutex_init(mu_, &mutex_attr));
+  PthreadCall("destroy mutex attr",
+              pthread_mutexattr_destroy(&mutex_attr));
+
+  // Initialize a process-sharable condition variable.
+  PthreadCall("init cvar attr", pthread_condattr_init(&cvar_attr));
+  PthreadCall("set cvar pshared",
+              pthread_condattr_setpshared(&cvar_attr, PTHREAD_PROCESS_SHARED));
+  PthreadCall("init cvar", pthread_cond_init(bgsignal_, &cvar_attr));
+  PthreadCall("destroy cvar attr", pthread_condattr_destroy(&cvar_attr));
+
+  //PthreadCall("cvar_init", pthread_cond_init(&bgsignal_, nullptr));
 #endif
 }
 
 ThreadPoolImpl::~ThreadPoolImpl() { assert(bgthreads_.size() == 0U); }
 
 void ThreadPoolImpl::JoinAllThreads() {
-  Lock lock(mu_);
+  Lock lock(*mu_);
   PthreadCall("lock", ThreadPoolMutexLock(lock));
   assert(!exit_all_threads_);
   exit_all_threads_ = true;
-  PthreadCall("signalall", ConditionSignalAll(bgsignal_));
+  PthreadCall("signalall", ConditionSignalAll(*bgsignal_));
   PthreadCall("unlock", MutexUnlock(lock));
 
   for (auto& th : bgthreads_) {
@@ -157,9 +196,9 @@ void ThreadPoolImpl::JoinAllThreads() {
 
 void ThreadPoolImpl::LowerIOPriority() {
 #ifdef OS_LINUX
-  PthreadCall("lock", pthread_mutex_lock(&mu_));
+  PthreadCall("lock", pthread_mutex_lock(mu_));
   low_io_priority_ = true;
-  PthreadCall("unlock", pthread_mutex_unlock(&mu_));
+  PthreadCall("unlock", pthread_mutex_unlock(mu_));
 #endif
 }
 
@@ -167,12 +206,12 @@ void ThreadPoolImpl::BGThread(size_t thread_id) {
   bool low_io_priority = false;
   while (true) {
 // Wait until there is an item that is ready to run
-    Lock uniqueLock(mu_);
+    Lock uniqueLock(*mu_);
     PthreadCall("lock", ThreadPoolMutexLock(uniqueLock));
     // Stop waiting if the thread needs to do work or needs to terminate.
     while (!exit_all_threads_ && !IsLastExcessiveThread(thread_id) &&
            (queue_.empty() || IsExcessiveThread(thread_id))) {
-      PthreadCall("wait", ConditionWait(bgsignal_, uniqueLock));
+      PthreadCall("wait", ConditionWait(*bgsignal_, uniqueLock));
     }
 
     if (exit_all_threads_) {  // mechanism to let BG threads exit safely
@@ -258,11 +297,11 @@ static void* BGThreadWrapper(void* arg) {
 }
 
 void ThreadPoolImpl::WakeUpAllThreads() {
-  PthreadCall("signalall", ConditionSignalAll(bgsignal_));
+  PthreadCall("signalall", ConditionSignalAll(*bgsignal_));
 }
 
 void ThreadPoolImpl::SetBackgroundThreadsInternal(int num, bool allow_reduce) {
-  Lock lock(mu_);
+  Lock lock(*mu_);
   PthreadCall("lock", ThreadPoolMutexLock(lock));
   if (exit_all_threads_) {
     PthreadCall("unlock", MutexUnlock(lock));
@@ -314,7 +353,7 @@ void ThreadPoolImpl::StartBGThreads() {
 
 void ThreadPoolImpl::Schedule(void (*function)(void* arg1), void* arg,
                               void* tag, void (*unschedFunction)(void* arg)) {
-  Lock lock(mu_);
+  Lock lock(*mu_);
   PthreadCall("lock", ThreadPoolMutexLock(lock));
 
   if (exit_all_threads_) {
@@ -335,7 +374,7 @@ void ThreadPoolImpl::Schedule(void (*function)(void* arg1), void* arg,
 
   if (!HasExcessiveThread()) {
     // Wake up at least one waiting thread.
-    PthreadCall("signal", ConditionSignal(bgsignal_));
+    PthreadCall("signal", ConditionSignal(*bgsignal_));
   } else {
     // Need to wake up all threads to make sure the one woken
     // up is not the one to terminate.
@@ -348,7 +387,7 @@ void ThreadPoolImpl::Schedule(void (*function)(void* arg1), void* arg,
 int ThreadPoolImpl::UnSchedule(void* arg) {
   int count = 0;
 
-  Lock lock(mu_);
+  Lock lock(*mu_);
   PthreadCall("lock", ThreadPoolMutexLock(lock));
 
   // Remove from priority queue

@@ -113,7 +113,7 @@ class Mutex {
 
  private:
   friend class CondVar;
-  pthread_mutex_t mu_;
+  pthread_mutex_t* mu_;
 #ifndef NDEBUG
   bool locked_;
 #endif
@@ -135,7 +135,7 @@ class RWMutex {
   void AssertHeld() { }
 
  private:
-  pthread_rwlock_t mu_; // the underlying platform mutex
+  pthread_rwlock_t* mu_; // the underlying platform mutex
 
   // No copying allowed
   RWMutex(const RWMutex&);
@@ -152,7 +152,7 @@ class CondVar {
   void Signal();
   void SignalAll();
  private:
-  pthread_cond_t cv_;
+  pthread_cond_t* cv_;
   Mutex* mu_;
 };
 

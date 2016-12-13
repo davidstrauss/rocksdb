@@ -810,7 +810,7 @@ class PosixEnv : public Env {
   size_t page_size_;
 
   std::vector<ThreadPoolImpl> thread_pools_;
-  pthread_mutex_t mu_;
+  pthread_mutex_t* mu_;
   std::vector<pthread_t> threads_to_join_;
 };
 
@@ -819,7 +819,26 @@ PosixEnv::PosixEnv()
       forceMmapOff_(false),
       page_size_(getpagesize()),
       thread_pools_(Priority::TOTAL) {
-  ThreadPoolImpl::PthreadCall("mutex_init", pthread_mutex_init(&mu_, nullptr));
+  pthread_mutexattr_t mutex_attr;
+
+  //int zfd = open("/tmp/env_posix_mutex.XXXXXX", O_RDWR | O_CREAT, 0666);
+  //int zfd = open("/dev/zero", O_RDWR);
+  char fd_template[] = "/tmp/env_posix_mutex.XXXXXX";
+  int zfd = mkstemp(fd_template);
+  posix_fallocate(zfd, 0, sizeof(pthread_mutex_t));
+  mu_ = (pthread_mutex_t*) mmap(0, sizeof(pthread_mutex_t), PROT_READ | PROT_WRITE, MAP_SHARED, zfd, 0);
+  close(zfd);
+  //mu_ = (pthread_mutex_t*) mmap(NULL, sizeof(pthread_mutex_t), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+
+  ThreadPoolImpl::PthreadCall("init mutex attr", pthread_mutexattr_init(&mutex_attr));
+  ThreadPoolImpl::PthreadCall("set mutex pshared",
+                              pthread_mutexattr_setpshared(&mutex_attr,
+                              PTHREAD_PROCESS_SHARED));
+  ThreadPoolImpl::PthreadCall("init mutex", pthread_mutex_init(mu_, &mutex_attr));
+  ThreadPoolImpl::PthreadCall("destroy mutex attr",
+                              pthread_mutexattr_destroy(&mutex_attr));
+
+  //ThreadPoolImpl::PthreadCall("mutex_init", pthread_mutex_init(mu_, nullptr));
   for (int pool_id = 0; pool_id < Env::Priority::TOTAL; ++pool_id) {
     thread_pools_[pool_id].SetThreadPriority(
         static_cast<Env::Priority>(pool_id));
@@ -863,9 +882,9 @@ void PosixEnv::StartThread(void (*function)(void* arg), void* arg) {
   state->arg = arg;
   ThreadPoolImpl::PthreadCall(
       "start thread", pthread_create(&t, nullptr, &StartThreadWrapper, state));
-  ThreadPoolImpl::PthreadCall("lock", pthread_mutex_lock(&mu_));
+  ThreadPoolImpl::PthreadCall("lock", pthread_mutex_lock(mu_));
   threads_to_join_.push_back(t);
-  ThreadPoolImpl::PthreadCall("unlock", pthread_mutex_unlock(&mu_));
+  ThreadPoolImpl::PthreadCall("unlock", pthread_mutex_unlock(mu_));
 }
 
 void PosixEnv::WaitForJoin() {

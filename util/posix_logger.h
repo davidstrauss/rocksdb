@@ -16,6 +16,9 @@
 #include "port/sys_time.h"
 #include <time.h>
 #include <fcntl.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #ifdef OS_LINUX
 #ifndef FALLOC_FL_KEEP_SIZE
@@ -68,7 +71,8 @@ class PosixLogger : public Logger {
   virtual void Logv(const char* format, va_list ap) override {
     IOSTATS_TIMER_GUARD(logger_nanos);
 
-    const uint64_t thread_id = (*gettid_)();
+    //const uint64_t thread_id = (*gettid_)();
+    const uint64_t thread_id = (uint64_t) syscall(SYS_gettid);
 
     // We try twice: the first time with a fixed-size stack allocated buffer,
     // and the second time with a much larger dynamically allocated buffer.
