@@ -124,26 +124,36 @@ Status DBWithTTLImpl::CreateColumnFamily(const ColumnFamilyOptions& options,
   return CreateColumnFamilyWithTtl(options, column_family_name, handle, 0);
 }
 
-// Appends the expiration to the string.
-// Returns false if no expiration is specified and it could not get the
-// current_time, true if append succeeds
-Status DBWithTTLImpl::AppendExpiration(const Slice& val,
-                                       std::string* val_with_exp,
-                                       Env* env, int32_t exptime) {
-  val_with_exp->reserve(kTSLength + val.size());
-  char exp_string[kTSLength];
-  if (0 == exptime) {
-    int64_t curtime;
-    Status st = env->GetCurrentTime(&curtime);
+Status DBWithTTLImpl::AppendMetadata(const Slice& val,
+                                     std::string* val_with_metadata,
+                                     int32_t expiration_time_or_zero,
+                                     Env* env) {
+  char time_string[kEpochTimeLength];
+  char magic_number_string[kMagicNumberLength];
+
+  val_with_metadata->reserve(val.size() + kTimeTypeLength + kEpochTimeLength + kMagicNumberLength);
+  val_with_metadata->append(val.data(), val.size());
+
+  if (0 == expiration_time_or_zero) {
+    int64_t current_time;
+    Status st = env->GetCurrentTime(&current_time);
     if (!st.ok()) {
       return st;
     }
-    exptime = (int32_t)curtime;
+    expiration_time_or_zero = (int32_t)current_time;
+    val_with_metadata->append("exp:", kTimeTypeLength);
+  } else {
+    val_with_metadata->append("ttl:", kTimeTypeLength);
   }
-  EncodeFixed32(exp_string, exptime);
-  val_with_exp->append(val.data(), val.size());
-  val_with_exp->append(exp_string, kTSLength);
-  return Status::OK();
+
+  // Append the epoch time value.
+  EncodeFixed32(time_string, (int32_t)expiration_time_or_zero);
+  val_with_metadata->append(time_string, kEpochTimeLength);
+
+  // Append the magic number.
+  EncodeFixed32(magic_number_string, kMagicNumber);
+  val_with_metadata->append(magic_number_string, kMagicNumberLength);
+  return st;
 }
 
 // Returns corruption if the length of the string is lesser than timestamp, or
@@ -261,16 +271,16 @@ Status DBWithTTLImpl::Merge(const WriteOptions& options,
 
 Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
                                           WriteBatch* updates,
-                                          int32_t expiration_time) {
+                                          int32_t expiration_time_or_zero) {
   class Handler : public WriteBatch::Handler {
    public:
-    explicit Handler(Env* env, int32_t exptime) : env_(env), exptime_(exptime) {}
+    explicit Handler(Env* env, int32_t exptime) : env_(env), expiration_time_or_zero_(expiration_time_or_zero) {}
     WriteBatch updates_ttl;
     Status batch_rewrite_status;
     virtual Status PutCF(uint32_t column_family_id, const Slice& key,
                          const Slice& value) override {
       std::string value_with_ts;
-      Status st = AppendExpiration(value, &value_with_ts, env_, exptime_);
+      Status st = AppendMetadata(value, &value_with_ts, env_, expiration_time_or_zero_);
       if (!st.ok()) {
         batch_rewrite_status = st;
       } else {
@@ -282,7 +292,7 @@ Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
     virtual Status MergeCF(uint32_t column_family_id, const Slice& key,
                            const Slice& value) override {
       std::string value_with_ts;
-      Status st = AppendExpiration(value, &value_with_ts, env_, exptime_);
+      Status st = AppendMetadata(value, &value_with_ts, env_, expiration_time_or_zero_);
       if (!st.ok()) {
         batch_rewrite_status = st;
       } else {
@@ -302,9 +312,9 @@ Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
 
    private:
     Env* env_;
-    int32_t exptime_;
+    int32_t expiration_time_or_zero_;
   };
-  Handler handler(GetEnv(), expiration_time);
+  Handler handler(GetEnv(), expiration_time_or_zero);
   updates->Iterate(&handler);
   if (!handler.batch_rewrite_status.ok()) {
     return handler.batch_rewrite_status;

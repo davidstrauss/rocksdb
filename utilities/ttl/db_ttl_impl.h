@@ -25,7 +25,7 @@
 
 namespace rocksdb {
 
-class DBWithTTLImpl : public DBWithTTL {
+	class DBWithTTLImpl : public DBWithTTL {
  public:
   static void SanitizeOptions(int32_t ttl, ColumnFamilyOptions* options,
                               Env* env);
@@ -98,7 +98,17 @@ class DBWithTTLImpl : public DBWithTTL {
 
   static Status StripTS(std::string* str);
 
-  static const uint32_t kTSLength = sizeof(int32_t);  // size of timestamp
+  // The type includes three ASCII characters for type plus a colon delimiter.
+  // Currently supported values are "exp:" and "ttl:".
+  static const uint32_t kTimeTypeLength = sizeof(char) * 4;
+
+  static const uint32_t kEpochTimeLength = sizeof(int32_t);
+
+  // The magic number uses the epoch time's string length to guarantee
+  // compatibility with previous releases that only appended a timestamp.
+  static const uint32_t kMagicNumberLength = kEpochTimeLength;
+
+  static const int32_t kMagicNumber = 7904202;
 
   static const int32_t kMinTimestamp = 1368146402;  // 05/09/2013:5:40PM GMT-8
 
