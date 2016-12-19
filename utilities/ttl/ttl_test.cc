@@ -163,7 +163,7 @@ class TtlTest : public testing::Test {
   // Puts num_entries starting from start_pos_map from kvmap_ into the database
   void PutValues(int64_t start_pos_map, int64_t num_entries, bool flush = true,
                  ColumnFamilyHandle* cf = nullptr, bool use_ttl_db = true,
-                 uint32_t expiration_time = 0) {
+                 bool use_expiration = false, uint32_t expiration_time = 0) {
     if (use_ttl_db) {
       ASSERT_TRUE(db_ttl_);
     } else {
@@ -177,7 +177,7 @@ class TtlTest : public testing::Test {
     for (int64_t i = 0; kv_it_ != kvmap_.end() && i < num_entries;
          i++, ++kv_it_) {
       if (use_ttl_db) {
-        if (expiration_time > 0) {
+        if (use_expiration) {
           ASSERT_OK(cf == nullptr
                         ? db_ttl_->PutWithExpiration(wopts, kv_it_->first, kv_it_->second, expiration_time)
                         : db_ttl_->PutWithExpiration(wopts, cf, kv_it_->first, kv_it_->second, expiration_time));
@@ -660,20 +660,33 @@ TEST_F(TtlTest, LegacyTimestampsAbsentAfterTTL) {
   CloseTtl();
 }
 
+// Values created with an expiration of zero should not be removed.
 TEST_F(TtlTest, NoExpiration) {
   MakeKVMap(kSampleSize_);
   int64_t boundary1 = kSampleSize_ / 3;
 
   OpenTtl();
-  PutValues(0, boundary1, true, nullptr, false, 0); //T=0: Set1 never deleted
+  PutValues(0, boundary1, true, nullptr, true, true, 0);  //T=0: Set1 never deleted
   SleepCompactCheck(1, 0, boundary1);               //T=1: Set1 still there
   CloseTtl();
 
   OpenTtl(1);
-  PutValues(0, boundary1, true, nullptr, false, 0); //T=0: Set1 never deleted
+  PutValues(0, boundary1, true, nullptr, true, true, 0);  //T=0: Set1 never deleted
   SleepCompactCheck(2, 0, boundary1);               //T=1: Set1 still there
   CloseTtl();
+}
 
+TEST_F(TtlTest, AbsentAfterExpiration) {
+  MakeKVMap(kSampleSize_);
+
+  int64_t curtime;
+
+  OpenTtl();
+  Status st = env_->GetCurrentTime(&curtime);
+  assert(st.ok());
+  PutValues(0, kSampleSize_, true, nullptr, true, true, (int32_t)curtime + 1); //T=0: Set1 with an expiration one second in the future
+  SleepCompactCheck(2, 0, kSampleSize_, false); // T=2:Set1 should not be there
+  CloseTtl();
 }
 
 TEST_F(TtlTest, ColumnFamiliesTest) {

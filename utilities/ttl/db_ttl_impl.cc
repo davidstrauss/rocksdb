@@ -13,6 +13,8 @@
 #include "rocksdb/utilities/db_ttl.h"
 #include "util/coding.h"
 
+#include <iostream>
+
 namespace rocksdb {
 
 void DBWithTTLImpl::SanitizeOptions(int32_t ttl, ColumnFamilyOptions* options,
@@ -139,8 +141,10 @@ Status DBWithTTLImpl::AppendMetadata(std::string& value,
       return st;
     }
     epoch_time = (int32_t)current_time;
+    //std::cout << "Appending ttl:" << std::endl;
     value.append("ttl:", kTimeTypeLength);
   } else {
+    //std::cout << "Appending exp:" << std::endl;
     value.append("exp:", kTimeTypeLength);
   }
 
@@ -205,6 +209,7 @@ Status DBWithTTLImpl::ParseMetadata(const char* value, size_t value_len,
   }
 
   if (memcmp(time_type, "exp:", kTimeTypeLength) == 0) {
+    //std::cout << "found expiration" << std::endl;
     if (is_expiration) {
       *is_expiration = true;
     }
@@ -212,6 +217,7 @@ Status DBWithTTLImpl::ParseMetadata(const char* value, size_t value_len,
   }
 
   if (memcmp(time_type, "ttl:", kTimeTypeLength) == 0) {
+    //std::cout << "found ttl" << std::endl;
     if (is_expiration) {
       *is_expiration = false;
     }
@@ -272,6 +278,7 @@ bool DBWithTTLImpl::IsStale(const Slice& value, int32_t ttl, Env* env) {
   }
 
   if (is_expiration) {
+    //std::cout << "Expiration, epoch_time = " << epoch_time << std::endl;
     // A non-positive expiration indicates never-expiring data.
     if (epoch_time <= 0) {
       return false;
@@ -283,6 +290,8 @@ bool DBWithTTLImpl::IsStale(const Slice& value, int32_t ttl, Env* env) {
     }
     return epoch_time < curtime;
   }
+
+  //std::cout << "Timestamp, epoch_time = " << epoch_time << std::endl;
 
   // We're now working under the assumption the epoch_time is a timestamp whose
   // age should be compared against the TTL (if positive) specified on DB open.
@@ -401,6 +410,8 @@ Status DBWithTTLImpl::Merge(const WriteOptions& options,
 Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
                                           WriteBatch* updates,
                                           int32_t expiration_time) {
+  //std::cout << "WriteWithExpiration expiration_time = " << expiration_time << std::endl;
+
   class Handler : public WriteBatch::Handler {
    public:
     explicit Handler(Env* env, int32_t exptime) : env_(env), expiration_time_(exptime) {}
