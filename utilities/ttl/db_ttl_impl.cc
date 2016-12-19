@@ -125,32 +125,33 @@ Status DBWithTTLImpl::CreateColumnFamily(const ColumnFamilyOptions& options,
 }
 
 Status DBWithTTLImpl::AppendMetadata(std::string& value,
-                                     int32_t expiration_time,  // -1 for TTL
+                                     int32_t epoch_time,  // -1 for TTL
                                      Env* env) {
   char time_string[kTimeLength];
   char magic_number_string[kMagicNumberLength];
 
   // An expiration time of zero means save the current timestamp and expire
   // the record using TTLs.
-  if (-1 == expiration_time) {
+  if (-1 == epoch_time) {
     int64_t current_time;
     Status st = env->GetCurrentTime(&current_time);
     if (!st.ok()) {
       return st;
     }
-    expiration_time = (int32_t)current_time;
-    value.append("exp:", kTimeTypeLength);
-  } else {
+    epoch_time = (int32_t)current_time;
     value.append("ttl:", kTimeTypeLength);
+  } else {
+    value.append("exp:", kTimeTypeLength);
   }
 
   // Append the epoch time value.
-  EncodeFixed32(time_string, (int32_t)expiration_time);
+  EncodeFixed32(time_string, (int32_t)epoch_time);
   value.append(time_string, kTimeLength);
 
   // Append the magic number.
   EncodeFixed32(magic_number_string, kMagicNumber);
   value.append(magic_number_string, kMagicNumberLength);
+
   return Status::OK();
 }
 

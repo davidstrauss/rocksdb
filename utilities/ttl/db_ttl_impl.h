@@ -154,7 +154,7 @@ class TtlIterator : public Iterator {
   Slice key() const override { return iter_->key(); }
 
   int32_t timestamp() const {
-    int32_t epoch_time;
+    int32_t epoch_time = 0;
     assert(DBWithTTLImpl::ParseMetadata(iter_->value(), nullptr, &epoch_time,
                                         nullptr).ok());
     return epoch_time;
@@ -165,7 +165,7 @@ class TtlIterator : public Iterator {
     assert(DBWithTTLImpl::SanityCheckMetadata(iter_->value()).ok());
     Slice trimmed_value = iter_->value();
     Status st;
-    size_t metadata_length;
+    size_t metadata_length = 0;
     assert(DBWithTTLImpl::ParseMetadata(trimmed_value, nullptr, nullptr,
 					&metadata_length).ok());
     trimmed_value.size_ -= metadata_length;
@@ -205,7 +205,7 @@ class TtlCompactionFilter : public CompactionFilter {
     if (user_comp_filter_ == nullptr) {
       return false;
     }
-    size_t metadata_length;
+    size_t metadata_length = 0;
     assert(DBWithTTLImpl::ParseMetadata(old_val, nullptr, nullptr,
 					&metadata_length).ok());
     Slice old_val_without_metadata(old_val.data(),
