@@ -91,20 +91,21 @@ namespace rocksdb {
 
   static bool IsStale(const Slice& value, int32_t ttl, Env* env);
 
-  static Status AppendMetadata(const Slice& val, std::string* val_with_metadata,
-			       int32_t expiration_time, Env* env);
+  static Status AppendMetadata(std::string* value, int32_t expiration_time,
+                               Env* env);
+  static Status AppendMetadata(const Slice& val, std::string* value,
+                               int32_t expiration_time, Env* env);
 
-  static Status ParseMetadata(const char* value, size_t value_len,
-                              bool& is_expiration,
-                              int32_t& epoch_time);
-  static Status ParseMetadata(const Slice& value, bool& is_expiration,
-                              int32_t& epoch_time);
+
+  static Status ParseMetadata(const char* value, size_t* value_len,
+                              bool* is_expiration, int32_t* epoch_time,
+			      size_t* length);
+  static Status ParseMetadata(const Slice& value, bool* is_expiration,
+                              int32_t* epoch_time, size_t* length);
   static Status ParseMetadata(const std::string& str, bool& is_expiration,
-                              int32_t& epoch_time)
+                              int32_t* epoch_time, size_t* length)
 
   static Status SanityCheckMetadata(const Slice& str);
-
-  static Status GetMetadataLength(std::string* str, size_t& length);
 
   static Status StripMetadata(std::string* str);
 
@@ -113,6 +114,8 @@ namespace rocksdb {
   static const uint32_t kTimeTypeLength = sizeof(char) * 4;
 
   static const uint32_t kTimeLength = sizeof(int32_t);
+
+  static const size_t kNewMetadataLen = kTimeTypeLength + kTimeLength + kMagicNumberLength;
 
   // The magic number uses the epoch time's string length to guarantee
   // compatibility with previous releases that only appended a timestamp. This
@@ -163,7 +166,8 @@ class TtlIterator : public Iterator {
     Slice trimmed_value = iter_->value();
     Status st;
     size_t metadata_length;
-    assert(DBWithTTLImpl::GetMetadataLength(trimmed_value.data(), metadata_length).ok();
+    assert(DBWithTTLImpl::ParseMetadata(trimmed_value.data(), nullptr, nullptr,
+					&metadata_length).ok();
     trimmed_value.size_ -= metadata_length;
     return trimmed_value;
   }
@@ -202,7 +206,8 @@ class TtlCompactionFilter : public CompactionFilter {
       return false;
     }
     size_t metadata_length;
-    assert(DBWithTTLImpl::GetMetadataLength(trimmed_value.data(), metadata_length).ok());
+    assert(DBWithTTLImpl::ParseMetadata(trimmed_value.data(), nullptr, nullptr,
+					&metadata_length).ok());
     Slice old_val_without_metadata(old_val.data(),
                                    old_val.size() - metadata_length);
     if (user_comp_filter_->Filter(level, key, old_val_without_metadata, new_val,
@@ -270,10 +275,11 @@ class TtlMergeOperator : public MergeOperator {
     Status st;
     size_t existing_value_metadata_len;
     bool existing_is_expiration = false;
-    int32_t existing_epoch_time;
+    int32_t existing_epoch_time = -1;
 
     if (merge_in.existing_value)
-      st = DBWithTTLImpl::GetMetadataLength(merge_in.existing_value, existing_value_metadata_len);
+      st = DBWithTTLImpl::ParseMetadata(merge_in.existing_value, nullptr,
+					nullptr, &existing_value_metadata_len);
       if (!st.ok()) {
         Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
             "Error: Invalid metadata on existing value.");
@@ -281,11 +287,12 @@ class TtlMergeOperator : public MergeOperator {
       }
     }
 
-    // Extract time-stamp from each operand to be passed to user_merge_op_
+    // Strip metadata from each operand to be passed to user_merge_op_
     std::vector<Slice> operands_without_metadata;
     for (const auto& operand : merge_in.operand_list) {
       size_t metadata_length;
-      st = DBWithTTLImpl::GetMetadataLength(operand.data(), metadata_length);
+      st = DBWithTTLImpl::ParseMetadata(operand.data(), nullptr, nullptr,
+					&metadata_length);
       if (!st.ok()) {
         Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
             "Error: Could not remove metadata from operand value.");
@@ -325,47 +332,51 @@ class TtlMergeOperator : public MergeOperator {
     }
 
     if (merge_in.existing_value) {
-      st = DBWithTTLImpl::ReadMetadata(merge_in.existing_value,
+      st = DBWithTTLImpl::ParseMetadata(merge_in.existing_value,
 				       existing_is_expiration,
-				       existing_epoch_time);
+				       existing_epoch_time, nullptr);
       if (!st.ok()) {
         Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
             "Error: Invalid metadata on existing value.");
         return false;
       }
+
+      // Set the existing_epoch_time to write a fresh timestamp when we append
+      // metadata below.
+      if (!existing_is_expiration) {
+        existing_epoch_time = -1;
+      }
     }
 
-    // Augment the *new_value with the ttl time-stamp
-    int64_t curtime;
-    if (!env_->GetCurrentTime(&curtime).ok()) {
-      Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
-          "Error: Could not get current time to be attached internally "
-          "to the new value.");
-      return false;
-    } else {
-      char ts_string[ts_len];
-      EncodeFixed32(ts_string, (int32_t)curtime);
-      merge_out->new_value.append(ts_string, ts_len);
-      return true;
+    // Re-append the existing expiration or append a new timestamp for TTL use.
+    st = DBWithTTLImpl::AppendMetadata(merge_out->new_value, existing_epoch_time, env_);
+    if (!st.ok()) {
+        Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
+            "Error: Could not append updated metadata.");
+        return false;
     }
+    return true;
   }
 
   virtual bool PartialMergeMulti(const Slice& key,
                                  const std::deque<Slice>& operand_list,
                                  std::string* new_value, Logger* logger) const
       override {
-    const uint32_t ts_len = DBWithTTLImpl::kTSLength;
     std::deque<Slice> operands_without_metadata;
+    bool existing_is_expiration;
+    int32_t existing_epoch_time;
 
     for (const auto& operand : operand_list) {
-      if (operand.size() < ts_len) {
-        Log(InfoLogLevel::ERROR_LEVEL, logger,
-            "Error: Could not remove timestamp from value.");
+      size_t metadata_length;
+      // We will retain the latest expiration_time to reapply it.
+      st = DBWithTTLImpl::ParseMetadata(operand.data(), &is_expiration,
+                                        &expiration_time, &metadata_length);
+      if (!st.ok()) {
+        Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
+            "Error: Could not remove metadata from operand value.");
         return false;
       }
-
-      operands_without_metadata.push_back(
-          Slice(operand.data(), operand.size() - ts_len));
+      operands_without_metadata.push_back(Slice(operand.data(), operand.size() - metadata_length));
     }
 
     // Apply the user partial-merge operator (store result in *new_value)
@@ -375,19 +386,21 @@ class TtlMergeOperator : public MergeOperator {
       return false;
     }
 
-    // Augment the *new_value with the ttl time-stamp
-    int64_t curtime;
-    if (!env_->GetCurrentTime(&curtime).ok()) {
-      Log(InfoLogLevel::ERROR_LEVEL, logger,
-          "Error: Could not get current time to be attached internally "
-          "to the new value.");
-      return false;
-    } else {
-      char ts_string[ts_len];
-      EncodeFixed32(ts_string, (int32_t)curtime);
-      new_value->append(ts_string, ts_len);
-      return true;
+    // If we're not working with an explicit expiration, bump the timestamp we
+    // use for TTL by setting the the epoch time to -1.
+    if (!existing_is_expiration) {
+      existing_epoch_time = -1;
     }
+
+    // Re-append the existing expiration or append a new timestamp for TTL use.
+    st = DBWithTTLImpl::AppendMetadata(new_value, existing_epoch_time, env_);
+    if (!st.ok()) {
+        Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
+            "Error: Could not append updated metadata.");
+        return false;
+    }
+
+    return true;
   }
 
   virtual const char* Name() const override { return "Merge By TTL"; }

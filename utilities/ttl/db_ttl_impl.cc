@@ -124,15 +124,11 @@ Status DBWithTTLImpl::CreateColumnFamily(const ColumnFamilyOptions& options,
   return CreateColumnFamilyWithTtl(options, column_family_name, handle, 0);
 }
 
-Status DBWithTTLImpl::AppendMetadata(const Slice& val,
-                                     std::string* val_with_metadata,
+Status DBWithTTLImpl::AppendMetadata(std::string* value,
                                      int32_t expiration_time,  // -1 for TTL
                                      Env* env) {
   char time_string[kTimeLength];
   char magic_number_string[kMagicNumberLength];
-
-  val_with_metadata->reserve(val.size() + kTimeTypeLength + kTimeLength + kMagicNumberLength);
-  val_with_metadata->append(val.data(), val.size());
 
   // An expiration time of zero means save the current timestamp and expire
   // the record using TTLs.
@@ -158,9 +154,19 @@ Status DBWithTTLImpl::AppendMetadata(const Slice& val,
   return st;
 }
 
+Status DBWithTTLImpl::AppendMetadata(const Slice& val,
+                                     std::string* value,
+                                     int32_t expiration_time,  // -1 for TTL
+                                     Env* env) {
+  val_with_metadata->reserve(val.data() + kNewMetadataLen);
+  val_with_metadata->append(val.data(), val.size());
+  return AppendMetadata(value, expiration_time, env);
+}
+
 Status DBWithTTLImpl::ParseMetadata(const char* value, size_t value_len,
-                                   bool& is_expiration,
-                                   int32_t& epoch_time) {
+                                   bool* is_expiration,
+                                   int32_t* epoch_time,
+                                   size_t* metadata_length) {
   if (value_len < kMagicNumberLength) {
     return Status::Corruption("Error: Value length less than magic number\n");
   }
@@ -171,28 +177,43 @@ Status DBWithTTLImpl::ParseMetadata(const char* value, size_t value_len,
   // If the number obtained isn't what's expected, the value is in the old
   // format, and the magic number is actually the timestamp of the write.
   if (kMagicNumber != magic_number) {
-    is_expiration = true;
-    epoch_time = magic_number;
+    if (is_expiration) {
+      *is_expiration = true;
+    }
+    if (epoch_time) {
+      *epoch_time = magic_number;
+    }
+    if (metadata_length) {
+      *metadata_length = kMagicNumberLength;
+    }
     return Status::OK();
   }
 
-  size_t metadata_length = kTimeTypeLength + kTimeLength + kMagicNumberLength;
+  if (metadata_length) {
+    *metadata_length = kNewMetadataLen;
+  }
 
-  if (value_len < metadata_length) {
+  if (value_len < kNewMetadataLen) {
     return Status::Corruption("Error: Value length less than expected metadata\n");
   }
 
-  char* time_type = value + value_len - metadata_length;
-  epoch_time =
-      DecodeFixed32(value + value_len - kMagicNumberLength - kTimeLength);
+  char* time_type = value + value_len - kNewMetadataLen;
+  if (epoch_time) {
+    *epoch_time =
+         DecodeFixed32(value + value_len - kMagicNumberLength - kTimeLength);
+  }
 
   if (memcmp(time_type, "exp:", kTimeTypeLength) == 0) {
-    is_expiration = true;
+    if (is_expiration) {
+      *is_expiration = true;
+    }
     return Status::OK();
   }
 
   if (memcmp(time_type, "ttl:", kTimeTypeLength) == 0) {
-    is_expiration = false;
+    if (is_expiration) {
+      *is_expiration = false;
+    }
     return Status::OK();
   }
 
@@ -200,15 +221,19 @@ Status DBWithTTLImpl::ParseMetadata(const char* value, size_t value_len,
 }
 
 Status DBWithTTLImpl::ParseMetadata(const Slice& str,
-                                   bool& is_expiration,
-                                   int32_t& epoch_time) {
-  return DBWithTTLImpl::ParseMetadata(str.data(), str.size());
+                                   bool* is_expiration,
+                                   int32_t* epoch_time
+                                   size_t* metadata_length) {
+  return DBWithTTLImpl::ParseMetadata(str.data(), str.size(), is_expiration,
+                                      epoch_time, metadata_length);
 }
 
 Status DBWithTTLImpl::ParseMetadata(const std::string& str,
-                                   bool& is_expiration,
-                                   int32_t& epoch_time) {
-  return DBWithTTLImpl::ParseMetadata(str.c_str(), str.length());
+                                   bool* is_expiration,
+                                   int32_t* epoch_time,
+                                   size_t* metadata_length) {
+  return DBWithTTLImpl::ParseMetadata(str.c_str(), str.length(), is_expiration,
+                                      epoch_time, metadata_length);
 }
 
 // Returns corruption if the length of the string is lesser than timestamp, or
@@ -217,7 +242,7 @@ Status DBWithTTLImpl::SanityCheckMetadata(const Slice& str) {
   Status st;
   bool is_expiration;
   int32_t epoch_time;
-  st = ParseMetadata(str, is_expiration, epoch_time);
+  st = ParseMetadata(str, is_expiration, epoch_time, nullptr);
   if (!st.ok()) {
     return st;
   }
@@ -240,7 +265,7 @@ bool DBWithTTLImpl::IsStale(const Slice& value, int32_t ttl, Env* env) {
   Status st;
   bool is_expiration;
   int32_t epoch_time;
-  st = ReadMetadata(str, is_expiration, epoch_time);
+  st = ReadMetadata(str, &is_expiration, &epoch_time, nullptr);
   if (!st.ok()) {
     return false;  // On error, treat the data as fresh.
   }
@@ -271,36 +296,11 @@ bool DBWithTTLImpl::IsStale(const Slice& value, int32_t ttl, Env* env) {
   return (epoch_time + ttl) < curtime;
 }
 
-// Returns the number of characters at the end of str that are metadata.
-Status DBWithTTLImpl::GetMetadataLength(std::string* str, size_t& length) {
-  Status st;
-  if (str->length() < kMagicNumberLength) {
-    return Status::Corruption("Bad timestamp or magic number in key-value");
-  }
-
-  int32_t magic_number =
-      DecodeFixed32(value.data() + value.size() - kMagicNumberLength);
-
-  // If the number obtained isn't what's expected, the value is in the old
-  // format, and the only thing to strip is the timestamp.
-  if (kMagicNumber != magic_number) {
-    length = kMagicNumberLength;
-  }
-
-  length = kTimeTypeLength + kTimeLength + kMagicNumberLength;
-
-  if (str->length() < length) {
-    return Status::Corruption("Bad metadata in key-value");
-  }
-
-  return st;
-}
-
 // Strips the metadata from the end of the string
 Status DBWithTTLImpl::StripMetadata(std::string* str) {
   Status st;
   size_t metadata_length;
-  st = GetMetadataLength(str, metadata_length);
+  st = ParseMetadata(str, nullptr, nullptr, &metadata_length);
   if (!st.ok()) {
     return st;
   }
