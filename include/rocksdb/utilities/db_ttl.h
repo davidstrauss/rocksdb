@@ -39,9 +39,9 @@ namespace rocksdb {
 //
 // !!!WARNING!!!:
 // Calling DB::Open directly to re-open a db created by this API will get
-//  corrupt values(timestamp suffixed) and no ttl effect will be there
+//  corrupt values (metadata suffixed) and no TTL effect will be there
 //  during the second Open, so use this API consistently to open the db
-// Be careful when passing ttl with a small positive value because the
+// Be careful when passing TTL with a small positive value because the
 //  whole database may be deleted in a small amount of time
 
 class DBWithTTL : public StackableDB {

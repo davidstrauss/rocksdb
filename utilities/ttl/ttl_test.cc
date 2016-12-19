@@ -5,10 +5,12 @@
 #ifndef ROCKSDB_LITE
 
 #include <memory>
+#include "rocksdb/db.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/utilities/db_ttl.h"
 #include "util/testharness.h"
 #include "util/logging.h"
+#include "util/coding.h"
 #include <map>
 #ifndef OS_WIN
 #include <unistd.h>
@@ -65,6 +67,12 @@ class TtlTest : public testing::Test {
     ASSERT_OK(DBWithTTL::Open(options_, dbname_, &db_ttl_));
   }
 
+  // Open a plain database; used to write legacy-format timestamps.
+  void OpenWithoutTtl() {
+    ASSERT_TRUE(db_without_ttl_ == nullptr);
+    ASSERT_OK(DB::Open(options_, dbname_, &db_without_ttl_));
+  }
+
   // Open database with TTL support when TTL provided with db_ttl_ pointer
   void OpenTtl(int32_t ttl) {
     ASSERT_TRUE(db_ttl_ == nullptr);
@@ -90,8 +98,13 @@ class TtlTest : public testing::Test {
     db_ttl_ = nullptr;
   }
 
+  void CloseWithoutTtl() {
+    delete db_without_ttl_;
+    db_without_ttl_ = nullptr;
+  }
+
   // Populates and returns a kv-map
-  void MakeKVMap(int64_t num_entries) {
+  void MakeKVMap(int64_t num_entries, bool include_legacy_ts = false) {
     kvmap_.clear();
     int digits = 1;
     for (int64_t dummy = num_entries; dummy /= 10; ++digits) {
@@ -100,6 +113,15 @@ class TtlTest : public testing::Test {
     for (int64_t i = 0; i < num_entries; i++) {
       std::string key = "key";
       std::string value = "value";
+      if (include_legacy_ts) {
+        uint32_t kTSLength = sizeof(int32_t);
+        char ts_string[kTSLength];
+        int64_t curtime;
+        Status st = env_->GetCurrentTime(&curtime);
+        assert(st.ok());
+        EncodeFixed32(ts_string, (int32_t)curtime);
+        value.append(ts_string, kTSLength);
+      }
       if (i % 10 == 0) {
         digits_in_i++;
       }
@@ -140,8 +162,12 @@ class TtlTest : public testing::Test {
 
   // Puts num_entries starting from start_pos_map from kvmap_ into the database
   void PutValues(int64_t start_pos_map, int64_t num_entries, bool flush = true,
-                 ColumnFamilyHandle* cf = nullptr) {
-    ASSERT_TRUE(db_ttl_);
+                 ColumnFamilyHandle* cf = nullptr, bool use_ttl_db = true) {
+    if (use_ttl_db) {
+      ASSERT_TRUE(db_ttl_);
+    } else {
+      ASSERT_TRUE(db_without_ttl_);
+    }
     ASSERT_LE(start_pos_map + num_entries, static_cast<int64_t>(kvmap_.size()));
     static WriteOptions wopts;
     static FlushOptions flush_opts;
@@ -149,18 +175,38 @@ class TtlTest : public testing::Test {
     advance(kv_it_, start_pos_map);
     for (int64_t i = 0; kv_it_ != kvmap_.end() && i < num_entries;
          i++, ++kv_it_) {
-      ASSERT_OK(cf == nullptr
-                    ? db_ttl_->Put(wopts, kv_it_->first, kv_it_->second)
-                    : db_ttl_->Put(wopts, cf, kv_it_->first, kv_it_->second));
+      if (use_ttl_db) {
+        ASSERT_OK(cf == nullptr
+                      ? db_ttl_->Put(wopts, kv_it_->first, kv_it_->second)
+                      : db_ttl_->Put(wopts, cf, kv_it_->first, kv_it_->second));
+      } else {
+        ASSERT_OK(cf == nullptr
+                      ? db_without_ttl_->Put(wopts, kv_it_->first, kv_it_->second)
+                      : db_without_ttl_->Put(wopts, cf, kv_it_->first, kv_it_->second));
+      }
     }
     // Put a mock kv at the end because CompactionFilter doesn't delete last key
-    ASSERT_OK(cf == nullptr ? db_ttl_->Put(wopts, "keymock", "valuemock")
-                            : db_ttl_->Put(wopts, cf, "keymock", "valuemock"));
+    if (use_ttl_db) {
+      ASSERT_OK(cf == nullptr ? db_ttl_->Put(wopts, "keymock", "valuemock")
+                              : db_ttl_->Put(wopts, cf, "keymock", "valuemock"));
+    } else {
+      ASSERT_OK(cf == nullptr ? db_without_ttl_->Put(wopts, "keymock", "valuemock")
+                              : db_without_ttl_->Put(wopts, cf, "keymock", "valuemock"));
+    }
+
     if (flush) {
-      if (cf == nullptr) {
-        db_ttl_->Flush(flush_opts);
+      if (use_ttl_db) {
+        if (cf == nullptr) {
+          db_ttl_->Flush(flush_opts);
+        } else {
+          db_ttl_->Flush(flush_opts, cf);
+        }
       } else {
-        db_ttl_->Flush(flush_opts, cf);
+        if (cf == nullptr) {
+          db_without_ttl_->Flush(flush_opts);
+        } else {
+          db_without_ttl_->Flush(flush_opts, cf);
+        }
       }
     }
   }
@@ -359,11 +405,11 @@ class TtlTest : public testing::Test {
       const std::string kNewValue_;
   };
 
-
   // Choose carefully so that Put, Gets & Compaction complete in 1 second buffer
   static const int64_t kSampleSize_ = 100;
   std::string dbname_;
   DBWithTTL* db_ttl_;
+  DB* db_without_ttl_;
   unique_ptr<SpecialTimeEnv> env_;
 
  private:
@@ -567,6 +613,23 @@ TEST_F(TtlTest, MultiGetTest) {
   SimpleMultiGetTest();
 
   CloseTtl();
+}
+
+TEST_F(TtlTest, LegacyTimestampsNoEffect) {
+  MakeKVMap(kSampleSize_, true);
+  int64_t boundary1 = kSampleSize_ / 3;
+
+  OpenWithoutTtl();
+  PutValues(0, boundary1, true, nullptr, false); //T=0: Set1 never deleted
+  CloseWithoutTtl();
+  OpenTtl();
+  SleepCompactCheck(1, 0, boundary1);            //T=1: Set1 still there
+  CloseTtl();
+
+  //OpenLegacyTtl(0);
+  //PutValues(0, kSampleSize_, false);
+  //SimpleMultiGetTest();
+  //CloseTtl();
 }
 
 TEST_F(TtlTest, ColumnFamiliesTest) {
