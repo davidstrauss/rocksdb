@@ -103,7 +103,7 @@ namespace rocksdb {
   static Status ParseMetadata(const Slice& value, bool* is_expiration,
                               int32_t* epoch_time, size_t* length);
   static Status ParseMetadata(const std::string& str, bool& is_expiration,
-                              int32_t* epoch_time, size_t* length)
+                              int32_t* epoch_time, size_t* length);
 
   static Status SanityCheckMetadata(const Slice& str);
 
@@ -156,7 +156,8 @@ class TtlIterator : public Iterator {
   int32_t epoch_time() const {
     bool is_expiration;
     int32_t epoch_time;
-    assert(ReadMetadata(iter_->value().data(), is_expiration, epoch_time).ok());
+    assert(DBWithTTLImpl::ParseMetadata(iter_->value().data(), &is_expiration,
+                                        &epoch_time, nullptr).ok());
     return epoch_time;
   }
 
@@ -206,7 +207,7 @@ class TtlCompactionFilter : public CompactionFilter {
       return false;
     }
     size_t metadata_length;
-    assert(DBWithTTLImpl::ParseMetadata(trimmed_value.data(), nullptr, nullptr,
+    assert(DBWithTTLImpl::ParseMetadata(old_val, nullptr, nullptr,
 					&metadata_length).ok());
     Slice old_val_without_metadata(old_val.data(),
                                    old_val.size() - metadata_length);
@@ -277,9 +278,11 @@ class TtlMergeOperator : public MergeOperator {
     bool existing_is_expiration = false;
     int32_t existing_epoch_time = -1;
 
-    if (merge_in.existing_value)
-      st = DBWithTTLImpl::ParseMetadata(merge_in.existing_value, nullptr,
-					nullptr, &existing_value_metadata_len);
+    // Obtain the metadata length for the existing value, if any.
+    // This also verifies that it's present and valid.
+    if (merge_in.existing_value) {
+      st = DBWithTTLImpl::ParseMetadata(*merge_in.existing_value, nullptr,
+                                        nullptr, &existing_value_metadata_len);
       if (!st.ok()) {
         Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
             "Error: Invalid metadata on existing value.");
@@ -332,9 +335,9 @@ class TtlMergeOperator : public MergeOperator {
     }
 
     if (merge_in.existing_value) {
-      st = DBWithTTLImpl::ParseMetadata(merge_in.existing_value,
-				       existing_is_expiration,
-				       existing_epoch_time, nullptr);
+      st = DBWithTTLImpl::ParseMetadata(*merge_in.existing_value,
+				       &existing_is_expiration,
+				       &existing_epoch_time, nullptr);
       if (!st.ok()) {
         Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
             "Error: Invalid metadata on existing value.");

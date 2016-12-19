@@ -88,8 +88,8 @@ class MergeOperator {
 
     // The key associated with the merge operation.
     const Slice& key;
-    // The existing value of the current key, nullptr means that the
-    // value dont exist.
+    // The existing value of the current key; nullptr means that there is no
+    // existing value.
     const Slice* existing_value;
     // A list of operands to apply.
     const std::vector<Slice>& operand_list;
