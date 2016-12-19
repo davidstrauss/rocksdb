@@ -179,7 +179,7 @@ Status DBWithTTLImpl::ParseMetadata(const char* value, size_t value_len,
   // format, and the magic number is actually the timestamp of the write.
   if (kMagicNumber != magic_number) {
     if (is_expiration) {
-      *is_expiration = true;
+      *is_expiration = false;
     }
     if (epoch_time) {
       *epoch_time = magic_number;
@@ -298,23 +298,31 @@ bool DBWithTTLImpl::IsStale(const Slice& value, int32_t ttl, Env* env) {
 }
 
 // Strips the metadata from the end of the string
-Status DBWithTTLImpl::StripMetadata(std::string* str) {
+Status DBWithTTLImpl::StripMetadata(std::string& str) {
   Status st;
   size_t metadata_length;
-  st = ParseMetadata(*str, nullptr, nullptr, &metadata_length);
+  st = ParseMetadata(str, nullptr, nullptr, &metadata_length);
   if (!st.ok()) {
     return st;
   }
-  str->erase(str->length() - metadata_length, metadata_length);
+  str.erase(str.length() - metadata_length, metadata_length);
   return st;
 }
 
 Status DBWithTTLImpl::PutWithExpiration(const WriteOptions& options,
-                          ColumnFamilyHandle* column_family, const Slice& key,
-                          const Slice& val, int32_t expiration_time) {
+                                        ColumnFamilyHandle* column_family,
+                                        const Slice& key, const Slice& val,
+                                        int32_t expiration_time) {
   WriteBatch batch;
   batch.Put(column_family, key, val);
   return WriteWithExpiration(options, &batch, expiration_time);
+}
+
+Status DBWithTTLImpl::PutWithExpiration(const WriteOptions& options,
+                                        const Slice& key, const Slice& val,
+                                        int32_t expiration_time) {
+  return PutWithExpiration(options, DefaultColumnFamily(), key, val,
+                           expiration_time);
 }
 
 Status DBWithTTLImpl::Put(const WriteOptions& options,
@@ -334,7 +342,7 @@ Status DBWithTTLImpl::Get(const ReadOptions& options,
   if (!st.ok()) {
     return st;
   }
-  return StripMetadata(value);
+  return StripMetadata(*value);
 }
 
 std::vector<Status> DBWithTTLImpl::MultiGet(
@@ -350,7 +358,7 @@ std::vector<Status> DBWithTTLImpl::MultiGet(
     if (!statuses[i].ok()) {
       continue;
     }
-    statuses[i] = StripMetadata(&(*values)[i]);
+    statuses[i] = StripMetadata((*values)[i]);
   }
   return statuses;
 }
@@ -361,7 +369,7 @@ bool DBWithTTLImpl::KeyMayExist(const ReadOptions& options,
                                 bool* value_found) {
   bool ret = db_->KeyMayExist(options, column_family, key, value, value_found);
   if (ret && value != nullptr && value_found != nullptr && *value_found) {
-    if (!SanityCheckMetadata(*value).ok() || !StripMetadata(value).ok()) {
+    if (!SanityCheckMetadata(*value).ok() || !StripMetadata(*value).ok()) {
       return false;
     }
   }
@@ -374,6 +382,13 @@ Status DBWithTTLImpl::MergeWithExpiration(const WriteOptions& options,
   WriteBatch batch;
   batch.Merge(column_family, key, value);
   return WriteWithExpiration(options, &batch, expiration_time);
+}
+
+Status DBWithTTLImpl::MergeWithExpiration(const WriteOptions& options,
+                            const Slice& key, const Slice& value,
+                            int32_t expiration_time) {
+  return MergeWithExpiration(options, DefaultColumnFamily(), key, value,
+                             expiration_time);
 }
 
 Status DBWithTTLImpl::Merge(const WriteOptions& options,

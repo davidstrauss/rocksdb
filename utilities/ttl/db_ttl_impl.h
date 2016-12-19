@@ -44,9 +44,11 @@ namespace rocksdb {
                             ColumnFamilyHandle** handle) override;
 
   Status PutWithExpiration(const WriteOptions& options,
-                     ColumnFamilyHandle* column_family, const Slice& key,
-                     const Slice& val, int32_t exptime);
-
+                           ColumnFamilyHandle* column_family, const Slice& key,
+                           const Slice& val, int32_t exptime) override;
+  Status PutWithExpiration(const WriteOptions& options,
+                           const Slice& key, const Slice& val,
+                           int32_t exptime) override;
   using StackableDB::Put;
   virtual Status Put(const WriteOptions& options,
                      ColumnFamilyHandle* column_family, const Slice& key,
@@ -71,8 +73,12 @@ namespace rocksdb {
                            bool* value_found = nullptr) override;
 
   Status MergeWithExpiration(const WriteOptions& options,
-                       ColumnFamilyHandle* column_family, const Slice& key,
-                       const Slice& value, int32_t exptime);
+                             ColumnFamilyHandle* column_family,
+                             const Slice& key, const Slice& value,
+                             int32_t exptime) override;
+  Status MergeWithExpiration(const WriteOptions& options,
+                             const Slice& key, const Slice& value,
+                             int32_t exptime) override;
 
   using StackableDB::Merge;
   virtual Status Merge(const WriteOptions& options,
@@ -80,7 +86,7 @@ namespace rocksdb {
                        const Slice& value) override;
 
   Status WriteWithExpiration(const WriteOptions& opts, WriteBatch* updates,
-			     int32_t expiration_time);
+			                       int32_t expiration_time) override;
   virtual Status Write(const WriteOptions& opts, WriteBatch* updates) override;
 
   using StackableDB::NewIterator;
@@ -107,7 +113,7 @@ namespace rocksdb {
 
   static Status SanityCheckMetadata(const Slice& str);
 
-  static Status StripMetadata(std::string* str);
+  static Status StripMetadata(std::string& str);
 
   // The type includes three ASCII characters for type plus a colon delimiter.
   // Currently supported values are "exp:" and "ttl:".

@@ -113,15 +113,6 @@ class TtlTest : public testing::Test {
     for (int64_t i = 0; i < num_entries; i++) {
       std::string key = "key";
       std::string value = "value";
-      if (include_legacy_ts) {
-        uint32_t kTSLength = sizeof(int32_t);
-        char ts_string[kTSLength];
-        int64_t curtime;
-        Status st = env_->GetCurrentTime(&curtime);
-        assert(st.ok());
-        EncodeFixed32(ts_string, (int32_t)curtime);
-        value.append(ts_string, kTSLength);
-      }
       if (i % 10 == 0) {
         digits_in_i++;
       }
@@ -131,6 +122,15 @@ class TtlTest : public testing::Test {
       }
       AppendNumberTo(&key, i);
       AppendNumberTo(&value, i);
+      if (include_legacy_ts) {
+        uint32_t kTSLength = sizeof(int32_t);
+        char ts_string[kTSLength];
+        int64_t curtime;
+        Status st = env_->GetCurrentTime(&curtime);
+        assert(st.ok());
+        EncodeFixed32(ts_string, (int32_t)curtime);
+        value.append(ts_string, kTSLength);
+      }
       kvmap_[key] = value;
     }
     ASSERT_EQ(static_cast<int64_t>(kvmap_.size()),
@@ -162,7 +162,8 @@ class TtlTest : public testing::Test {
 
   // Puts num_entries starting from start_pos_map from kvmap_ into the database
   void PutValues(int64_t start_pos_map, int64_t num_entries, bool flush = true,
-                 ColumnFamilyHandle* cf = nullptr, bool use_ttl_db = true) {
+                 ColumnFamilyHandle* cf = nullptr, bool use_ttl_db = true,
+                 uint32_t expiration_time = 0) {
     if (use_ttl_db) {
       ASSERT_TRUE(db_ttl_);
     } else {
@@ -176,9 +177,15 @@ class TtlTest : public testing::Test {
     for (int64_t i = 0; kv_it_ != kvmap_.end() && i < num_entries;
          i++, ++kv_it_) {
       if (use_ttl_db) {
-        ASSERT_OK(cf == nullptr
-                      ? db_ttl_->Put(wopts, kv_it_->first, kv_it_->second)
-                      : db_ttl_->Put(wopts, cf, kv_it_->first, kv_it_->second));
+        if (expiration_time > 0) {
+          ASSERT_OK(cf == nullptr
+                        ? db_ttl_->PutWithExpiration(wopts, kv_it_->first, kv_it_->second, expiration_time)
+                        : db_ttl_->PutWithExpiration(wopts, cf, kv_it_->first, kv_it_->second, expiration_time));
+        } else {
+          ASSERT_OK(cf == nullptr
+                        ? db_ttl_->Put(wopts, kv_it_->first, kv_it_->second)
+                        : db_ttl_->Put(wopts, cf, kv_it_->first, kv_it_->second));
+        }
       } else {
         ASSERT_OK(cf == nullptr
                       ? db_without_ttl_->Put(wopts, kv_it_->first, kv_it_->second)
@@ -615,21 +622,58 @@ TEST_F(TtlTest, MultiGetTest) {
   CloseTtl();
 }
 
+// Similar to NoEffect but initialized with legacy-format timestamps.
 TEST_F(TtlTest, LegacyTimestampsNoEffect) {
   MakeKVMap(kSampleSize_, true);
   int64_t boundary1 = kSampleSize_ / 3;
 
+  // Write initial data in the legacy format.
   OpenWithoutTtl();
   PutValues(0, boundary1, true, nullptr, false); //T=0: Set1 never deleted
   CloseWithoutTtl();
+
+  // Replace the KVMap with one with no appended timestamps. Otherwise,
+  // SleepCompactCheck below will expect timestamps in the returned data.
+  MakeKVMap(kSampleSize_, false);
+
+  // Reopen with the new implementation, which should still read the legacy
+  // timestamps correctly.
   OpenTtl();
   SleepCompactCheck(1, 0, boundary1);            //T=1: Set1 still there
   CloseTtl();
+}
 
-  //OpenLegacyTtl(0);
-  //PutValues(0, kSampleSize_, false);
-  //SimpleMultiGetTest();
-  //CloseTtl();
+// Same as AbsentAfterTTL but initialized with legacy-format timestamps.
+TEST_F(TtlTest, LegacyTimestampsAbsentAfterTTL) {
+  // Create a dataset with legacy-style appended TTLs.
+  MakeKVMap(kSampleSize_, true);
+
+  OpenWithoutTtl();  // T=0:Open a plain DB (no TTL)
+  PutValues(0, kSampleSize_, true, nullptr, false); // T=0:Insert Set1.
+  CloseWithoutTtl();
+
+  // Create the same dataset without appended TTLs.
+  MakeKVMap(kSampleSize_, false);
+
+  OpenTtl(1);  // T=0:Reopen the db with ttl = 2
+  SleepCompactCheck(2, 0, kSampleSize_, false); // T=2:Set1 should not be there
+  CloseTtl();
+}
+
+TEST_F(TtlTest, NoExpiration) {
+  MakeKVMap(kSampleSize_);
+  int64_t boundary1 = kSampleSize_ / 3;
+
+  OpenTtl();
+  PutValues(0, boundary1, true, nullptr, false, 0); //T=0: Set1 never deleted
+  SleepCompactCheck(1, 0, boundary1);               //T=1: Set1 still there
+  CloseTtl();
+
+  OpenTtl(1);
+  PutValues(0, boundary1, true, nullptr, false, 0); //T=0: Set1 never deleted
+  SleepCompactCheck(2, 0, boundary1);               //T=1: Set1 still there
+  CloseTtl();
+
 }
 
 TEST_F(TtlTest, ColumnFamiliesTest) {

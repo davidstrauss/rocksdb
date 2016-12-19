@@ -60,6 +60,26 @@ class DBWithTTL : public StackableDB {
                      DBWithTTL** dbptr, std::vector<int32_t> ttls,
                      bool read_only = false);
 
+  virtual Status PutWithExpiration(const WriteOptions& options,
+                                   ColumnFamilyHandle* column_family,
+				   const Slice& key, const Slice& val,
+				   int32_t expiration = 0) = 0;
+  virtual Status PutWithExpiration(const WriteOptions& options,
+				   const Slice& key, const Slice& val,
+				   int32_t expiration = 0) = 0;
+
+  virtual Status MergeWithExpiration(const WriteOptions& options,
+                                     ColumnFamilyHandle* column_family,
+				     const Slice& key,const Slice& value,
+				     int32_t expiration = 0) = 0;
+  virtual Status MergeWithExpiration(const WriteOptions& options,
+				     const Slice& key,const Slice& value,
+				     int32_t expiration = 0) = 0;
+
+  virtual Status WriteWithExpiration(const WriteOptions& opts,
+				     WriteBatch* updates,
+				     int32_t expiration = 0) = 0;
+
  protected:
   explicit DBWithTTL(DB* db) : StackableDB(db) {}
 };
