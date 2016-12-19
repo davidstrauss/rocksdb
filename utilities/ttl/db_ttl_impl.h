@@ -91,18 +91,18 @@ namespace rocksdb {
 
   static bool IsStale(const Slice& value, int32_t ttl, Env* env);
 
-  static Status AppendMetadata(std::string* value, int32_t expiration_time,
+  static Status AppendMetadata(std::string& value, int32_t expiration_time,
                                Env* env);
-  static Status AppendMetadata(const Slice& val, std::string* value,
+  static Status AppendMetadata(const Slice& val, std::string& value,
                                int32_t expiration_time, Env* env);
 
 
-  static Status ParseMetadata(const char* value, size_t* value_len,
+  static Status ParseMetadata(const char* value, size_t value_len,
                               bool* is_expiration, int32_t* epoch_time,
-			      size_t* length);
-  static Status ParseMetadata(const Slice& value, bool* is_expiration,
-                              int32_t* epoch_time, size_t* length);
-  static Status ParseMetadata(const std::string& str, bool& is_expiration,
+			                        size_t* length);
+  static Status ParseMetadata(const Slice& str, bool* is_expiration,
+                              int32_t* epoch_time, size_t* metadata_length);
+  static Status ParseMetadata(const std::string& str, bool* is_expiration,
                               int32_t* epoch_time, size_t* length);
 
   static Status SanityCheckMetadata(const Slice& str);
@@ -153,11 +153,10 @@ class TtlIterator : public Iterator {
 
   Slice key() const override { return iter_->key(); }
 
-  int32_t epoch_time() const {
-    bool is_expiration;
+  int32_t timestamp() const {
     int32_t epoch_time;
-    assert(DBWithTTLImpl::ParseMetadata(iter_->value().data(), &is_expiration,
-                                        &epoch_time, nullptr).ok());
+    assert(DBWithTTLImpl::ParseMetadata(iter_->value(), nullptr, &epoch_time,
+                                        nullptr).ok());
     return epoch_time;
   }
 
@@ -167,7 +166,7 @@ class TtlIterator : public Iterator {
     Slice trimmed_value = iter_->value();
     Status st;
     size_t metadata_length;
-    assert(DBWithTTLImpl::ParseMetadata(trimmed_value.data(), nullptr, nullptr,
+    assert(DBWithTTLImpl::ParseMetadata(trimmed_value, nullptr, nullptr,
 					&metadata_length).ok());
     trimmed_value.size_ -= metadata_length;
     return trimmed_value;
@@ -294,7 +293,7 @@ class TtlMergeOperator : public MergeOperator {
     std::vector<Slice> operands_without_metadata;
     for (const auto& operand : merge_in.operand_list) {
       size_t metadata_length;
-      st = DBWithTTLImpl::ParseMetadata(operand.data(), nullptr, nullptr,
+      st = DBWithTTLImpl::ParseMetadata(operand, nullptr, nullptr,
 					&metadata_length);
       if (!st.ok()) {
         Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
@@ -365,6 +364,7 @@ class TtlMergeOperator : public MergeOperator {
                                  const std::deque<Slice>& operand_list,
                                  std::string* new_value, Logger* logger) const
       override {
+    Status st;
     std::deque<Slice> operands_without_metadata;
     bool existing_is_expiration;
     int32_t existing_epoch_time;
@@ -372,10 +372,10 @@ class TtlMergeOperator : public MergeOperator {
     for (const auto& operand : operand_list) {
       size_t metadata_length;
       // We will retain the latest expiration_time to reapply it.
-      st = DBWithTTLImpl::ParseMetadata(operand.data(), &is_expiration,
-                                        &expiration_time, &metadata_length);
+      st = DBWithTTLImpl::ParseMetadata(operand, &existing_is_expiration,
+                                        &existing_epoch_time, &metadata_length);
       if (!st.ok()) {
-        Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
+        Log(InfoLogLevel::ERROR_LEVEL, logger,
             "Error: Could not remove metadata from operand value.");
         return false;
       }
@@ -396,9 +396,9 @@ class TtlMergeOperator : public MergeOperator {
     }
 
     // Re-append the existing expiration or append a new timestamp for TTL use.
-    st = DBWithTTLImpl::AppendMetadata(new_value, existing_epoch_time, env_);
+    st = DBWithTTLImpl::AppendMetadata(*new_value, existing_epoch_time, env_);
     if (!st.ok()) {
-        Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
+        Log(InfoLogLevel::ERROR_LEVEL, logger,
             "Error: Could not append updated metadata.");
         return false;
     }

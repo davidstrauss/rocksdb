@@ -124,7 +124,7 @@ Status DBWithTTLImpl::CreateColumnFamily(const ColumnFamilyOptions& options,
   return CreateColumnFamilyWithTtl(options, column_family_name, handle, 0);
 }
 
-Status DBWithTTLImpl::AppendMetadata(std::string* value,
+Status DBWithTTLImpl::AppendMetadata(std::string& value,
                                      int32_t expiration_time,  // -1 for TTL
                                      Env* env) {
   char time_string[kTimeLength];
@@ -132,34 +132,34 @@ Status DBWithTTLImpl::AppendMetadata(std::string* value,
 
   // An expiration time of zero means save the current timestamp and expire
   // the record using TTLs.
-  if (-1 == expiration_time_or_zero) {
+  if (-1 == expiration_time) {
     int64_t current_time;
     Status st = env->GetCurrentTime(&current_time);
     if (!st.ok()) {
       return st;
     }
-    expiration_time_or_zero = (int32_t)current_time;
-    val_with_metadata->append("exp:", kTimeTypeLength);
+    expiration_time = (int32_t)current_time;
+    value.append("exp:", kTimeTypeLength);
   } else {
-    val_with_metadata->append("ttl:", kTimeTypeLength);
+    value.append("ttl:", kTimeTypeLength);
   }
 
   // Append the epoch time value.
-  EncodeFixed32(time_string, (int32_t)expiration_time_or_zero);
-  val_with_metadata->append(time_string, kTimeLength);
+  EncodeFixed32(time_string, (int32_t)expiration_time);
+  value.append(time_string, kTimeLength);
 
   // Append the magic number.
   EncodeFixed32(magic_number_string, kMagicNumber);
-  val_with_metadata->append(magic_number_string, kMagicNumberLength);
-  return st;
+  value.append(magic_number_string, kMagicNumberLength);
+  return Status::OK();
 }
 
 Status DBWithTTLImpl::AppendMetadata(const Slice& val,
-                                     std::string* value,
+                                     std::string& value,
                                      int32_t expiration_time,  // -1 for TTL
                                      Env* env) {
-  val_with_metadata->reserve(val.data() + kNewMetadataLen);
-  val_with_metadata->append(val.data(), val.size());
+  value.reserve(val.size() + kNewMetadataLen);
+  value.append(val.data(), val.size());
   return AppendMetadata(value, expiration_time, env);
 }
 
@@ -197,7 +197,7 @@ Status DBWithTTLImpl::ParseMetadata(const char* value, size_t value_len,
     return Status::Corruption("Error: Value length less than expected metadata\n");
   }
 
-  char* time_type = value + value_len - kNewMetadataLen;
+  const char* time_type = value + value_len - kNewMetadataLen;
   if (epoch_time) {
     *epoch_time =
          DecodeFixed32(value + value_len - kMagicNumberLength - kTimeLength);
@@ -222,7 +222,7 @@ Status DBWithTTLImpl::ParseMetadata(const char* value, size_t value_len,
 
 Status DBWithTTLImpl::ParseMetadata(const Slice& str,
                                    bool* is_expiration,
-                                   int32_t* epoch_time
+                                   int32_t* epoch_time,
                                    size_t* metadata_length) {
   return DBWithTTLImpl::ParseMetadata(str.data(), str.size(), is_expiration,
                                       epoch_time, metadata_length);
@@ -242,7 +242,7 @@ Status DBWithTTLImpl::SanityCheckMetadata(const Slice& str) {
   Status st;
   bool is_expiration;
   int32_t epoch_time;
-  st = ParseMetadata(str, is_expiration, epoch_time, nullptr);
+  st = ParseMetadata(str, &is_expiration, &epoch_time, nullptr);
   if (!st.ok()) {
     return st;
   }
@@ -265,7 +265,7 @@ bool DBWithTTLImpl::IsStale(const Slice& value, int32_t ttl, Env* env) {
   Status st;
   bool is_expiration;
   int32_t epoch_time;
-  st = ReadMetadata(str, &is_expiration, &epoch_time, nullptr);
+  st = ParseMetadata(value, &is_expiration, &epoch_time, nullptr);
   if (!st.ok()) {
     return false;  // On error, treat the data as fresh.
   }
@@ -300,7 +300,7 @@ bool DBWithTTLImpl::IsStale(const Slice& value, int32_t ttl, Env* env) {
 Status DBWithTTLImpl::StripMetadata(std::string* str) {
   Status st;
   size_t metadata_length;
-  st = ParseMetadata(str, nullptr, nullptr, &metadata_length);
+  st = ParseMetadata(*str, nullptr, nullptr, &metadata_length);
   if (!st.ok()) {
     return st;
   }
@@ -329,11 +329,11 @@ Status DBWithTTLImpl::Get(const ReadOptions& options,
   if (!st.ok()) {
     return st;
   }
-  st = SanityCheckTimestamp(*value);
+  st = SanityCheckMetadata(*value);
   if (!st.ok()) {
     return st;
   }
-  return StripTS(value);
+  return StripMetadata(value);
 }
 
 std::vector<Status> DBWithTTLImpl::MultiGet(
@@ -345,11 +345,11 @@ std::vector<Status> DBWithTTLImpl::MultiGet(
     if (!statuses[i].ok()) {
       continue;
     }
-    statuses[i] = SanityCheckTimestamp((*values)[i]);
+    statuses[i] = SanityCheckMetadata((*values)[i]);
     if (!statuses[i].ok()) {
       continue;
     }
-    statuses[i] = StripTS(&(*values)[i]);
+    statuses[i] = StripMetadata(&(*values)[i]);
   }
   return statuses;
 }
@@ -360,7 +360,7 @@ bool DBWithTTLImpl::KeyMayExist(const ReadOptions& options,
                                 bool* value_found) {
   bool ret = db_->KeyMayExist(options, column_family, key, value, value_found);
   if (ret && value != nullptr && value_found != nullptr && *value_found) {
-    if (!SanityCheckTimestamp(*value).ok() || !StripTS(value).ok()) {
+    if (!SanityCheckMetadata(*value).ok() || !StripMetadata(value).ok()) {
       return false;
     }
   }
@@ -384,17 +384,17 @@ Status DBWithTTLImpl::Merge(const WriteOptions& options,
 
 Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
                                           WriteBatch* updates,
-                                          int32_t expiration_time_or_zero) {
+                                          int32_t expiration_time) {
   class Handler : public WriteBatch::Handler {
    public:
-    explicit Handler(Env* env, int32_t exptime) : env_(env),expiration_time_(or_zero_expiration_time_)or_zero {}
+    explicit Handler(Env* env, int32_t exptime) : env_(env), expiration_time_(exptime) {}
     WriteBatch updates_ttl;
     Status batch_rewrite_status;
     virtual Status PutCF(uint32_t column_family_id, const Slice& key,
                          const Slice& value) override {
       std::string value_with_ts;
-      Status st = AppendMetadata(value, &value_with_ts,
-                                 expiration_time_or_zero_, env_);
+      Status st = AppendMetadata(value, value_with_ts,
+                                 expiration_time_, env_);
       if (!st.ok()) {
         batch_rewrite_status = st;
       } else {
@@ -406,8 +406,8 @@ Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
     virtual Status MergeCF(uint32_t column_family_id, const Slice& key,
                            const Slice& value) override {
       std::string value_with_ts;
-      Status st = AppendMetadata(value, &value_with_ts,
-                                 expiration_time_or_zero_, env_);
+      Status st = AppendMetadata(value, value_with_ts,
+                                 expiration_time_, env_);
       if (!st.ok()) {
         batch_rewrite_status = st;
       } else {
@@ -427,9 +427,9 @@ Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
 
    private:
     Env* env_;
-    int32_t expiration_time_;or_zero_
+    int32_t expiration_time_;
   };
-  Handler handler(GetEnv(), expiration_time)_or_zero;
+  Handler handler(GetEnv(), expiration_time);
   updates->Iterate(&handler);
   if (!handler.batch_rewrite_status.ok()) {
     return handler.batch_rewrite_status;
