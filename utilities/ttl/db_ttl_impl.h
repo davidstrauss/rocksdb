@@ -91,22 +91,34 @@ namespace rocksdb {
 
   static bool IsStale(const Slice& value, int32_t ttl, Env* env);
 
-  static Status AppendExpiration(const Slice& val, std::string* val_with_ts,
-				 Env* env, int32_t exptime);
+  static Status AppendMetadata(const Slice& val, std::string* val_with_metadata,
+			       int32_t expiration_time, Env* env);
 
-  static Status SanityCheckTimestamp(const Slice& str);
+  static Status ParseMetadata(const char* value, size_t value_len,
+                              bool& is_expiration,
+                              int32_t& epoch_time);
+  static Status ParseMetadata(const Slice& value, bool& is_expiration,
+                              int32_t& epoch_time);
+  static Status ParseMetadata(const std::string& str, bool& is_expiration,
+                              int32_t& epoch_time)
 
-  static Status StripTS(std::string* str);
+  static Status SanityCheckMetadata(const Slice& str);
+
+  static Status GetMetadataLength(std::string* str, size_t& length);
+
+  static Status StripMetadata(std::string* str);
 
   // The type includes three ASCII characters for type plus a colon delimiter.
   // Currently supported values are "exp:" and "ttl:".
   static const uint32_t kTimeTypeLength = sizeof(char) * 4;
 
-  static const uint32_t kEpochTimeLength = sizeof(int32_t);
+  static const uint32_t kTimeLength = sizeof(int32_t);
 
   // The magic number uses the epoch time's string length to guarantee
-  // compatibility with previous releases that only appended a timestamp.
-  static const uint32_t kMagicNumberLength = kEpochTimeLength;
+  // compatibility with previous releases that only appended a timestamp. This
+  // magic number is outside the valid range of allowed timestamps, so it is a
+  // safe indicator that the value is in the new format.
+  static const uint32_t kMagicNumberLength = kTimeLength;
 
   static const int32_t kMagicNumber = 7904202;
 
@@ -138,16 +150,21 @@ class TtlIterator : public Iterator {
 
   Slice key() const override { return iter_->key(); }
 
-  int32_t timestamp() const {
-    return DecodeFixed32(iter_->value().data() + iter_->value().size() -
-                         DBWithTTLImpl::kTSLength);
+  int32_t epoch_time() const {
+    bool is_expiration;
+    int32_t epoch_time;
+    assert(ReadMetadata(iter_->value().data(), is_expiration, epoch_time).ok());
+    return epoch_time;
   }
 
   Slice value() const override {
-    // TODO: handle timestamp corruption like in general iterator semantics
-    assert(DBWithTTLImpl::SanityCheckTimestamp(iter_->value()).ok());
+    // TODO: handle metadata corruption like in general iterator semantics
+    assert(DBWithTTLImpl::SanityCheckMetadata(iter_->value()).ok());
     Slice trimmed_value = iter_->value();
-    trimmed_value.size_ -= DBWithTTLImpl::kTSLength;
+    Status st;
+    size_t metadata_length;
+    assert(DBWithTTLImpl::GetMetadataLength(trimmed_value.data(), metadata_length).ok();
+    trimmed_value.size_ -= metadata_length;
     return trimmed_value;
   }
 
@@ -184,17 +201,17 @@ class TtlCompactionFilter : public CompactionFilter {
     if (user_comp_filter_ == nullptr) {
       return false;
     }
-    assert(old_val.size() >= DBWithTTLImpl::kTSLength);
-    Slice old_val_without_ts(old_val.data(),
-                             old_val.size() - DBWithTTLImpl::kTSLength);
-    if (user_comp_filter_->Filter(level, key, old_val_without_ts, new_val,
+    size_t metadata_length;
+    assert(DBWithTTLImpl::GetMetadataLength(trimmed_value.data(), metadata_length).ok());
+    Slice old_val_without_metadata(old_val.data(),
+                                   old_val.size() - metadata_length);
+    if (user_comp_filter_->Filter(level, key, old_val_without_metadata, new_val,
                                   value_changed)) {
       return true;
     }
     if (*value_changed) {
       new_val->append(
-          old_val.data() + old_val.size() - DBWithTTLImpl::kTSLength,
-          DBWithTTLImpl::kTSLength);
+          old_val.data() + old_val.size() - metadata_length, metadata_length);
     }
     return false;
   }
@@ -250,23 +267,32 @@ class TtlMergeOperator : public MergeOperator {
 
   virtual bool FullMergeV2(const MergeOperationInput& merge_in,
                            MergeOperationOutput* merge_out) const override {
-    const uint32_t ts_len = DBWithTTLImpl::kTSLength;
-    if (merge_in.existing_value && merge_in.existing_value->size() < ts_len) {
-      Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
-          "Error: Could not remove timestamp from existing value.");
-      return false;
+    Status st;
+    size_t existing_value_metadata_len;
+    bool existing_is_expiration = false;
+    int32_t existing_epoch_time;
+
+    if (merge_in.existing_value)
+      st = DBWithTTLImpl::GetMetadataLength(merge_in.existing_value, existing_value_metadata_len);
+      if (!st.ok()) {
+        Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
+            "Error: Invalid metadata on existing value.");
+        return false;
+      }
     }
 
     // Extract time-stamp from each operand to be passed to user_merge_op_
-    std::vector<Slice> operands_without_ts;
+    std::vector<Slice> operands_without_metadata;
     for (const auto& operand : merge_in.operand_list) {
-      if (operand.size() < ts_len) {
+      size_t metadata_length;
+      st = DBWithTTLImpl::GetMetadataLength(operand.data(), metadata_length);
+      if (!st.ok()) {
         Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
-            "Error: Could not remove timestamp from operand value.");
+            "Error: Could not remove metadata from operand value.");
         return false;
       }
-      operands_without_ts.push_back(operand);
-      operands_without_ts.back().remove_suffix(ts_len);
+      operands_without_metadata.push_back(operand);
+      operands_without_metadata.back().remove_suffix(metadata_length);
     }
 
     // Apply the user merge operator (store result in *new_value)
@@ -274,15 +300,15 @@ class TtlMergeOperator : public MergeOperator {
     MergeOperationOutput user_merge_out(merge_out->new_value,
                                         merge_out->existing_operand);
     if (merge_in.existing_value) {
-      Slice existing_value_without_ts(merge_in.existing_value->data(),
-                                      merge_in.existing_value->size() - ts_len);
+      Slice existing_value_without_metadata(merge_in.existing_value->data(),
+                                      merge_in.existing_value->size() - existing_value_metadata_len);
       good = user_merge_op_->FullMergeV2(
-          MergeOperationInput(merge_in.key, &existing_value_without_ts,
-                              operands_without_ts, merge_in.logger),
+          MergeOperationInput(merge_in.key, &existing_value_without_metadata,
+                              operands_without_metadata, merge_in.logger),
           &user_merge_out);
     } else {
       good = user_merge_op_->FullMergeV2(
-          MergeOperationInput(merge_in.key, nullptr, operands_without_ts,
+          MergeOperationInput(merge_in.key, nullptr, operands_without_metadata,
                               merge_in.logger),
           &user_merge_out);
     }
@@ -296,6 +322,17 @@ class TtlMergeOperator : public MergeOperator {
       merge_out->new_value.assign(merge_out->existing_operand.data(),
                                   merge_out->existing_operand.size());
       merge_out->existing_operand = Slice(nullptr, 0);
+    }
+
+    if (merge_in.existing_value) {
+      st = DBWithTTLImpl::ReadMetadata(merge_in.existing_value,
+				       existing_is_expiration,
+				       existing_epoch_time);
+      if (!st.ok()) {
+        Log(InfoLogLevel::ERROR_LEVEL, merge_in.logger,
+            "Error: Invalid metadata on existing value.");
+        return false;
+      }
     }
 
     // Augment the *new_value with the ttl time-stamp
@@ -318,7 +355,7 @@ class TtlMergeOperator : public MergeOperator {
                                  std::string* new_value, Logger* logger) const
       override {
     const uint32_t ts_len = DBWithTTLImpl::kTSLength;
-    std::deque<Slice> operands_without_ts;
+    std::deque<Slice> operands_without_metadata;
 
     for (const auto& operand : operand_list) {
       if (operand.size() < ts_len) {
@@ -327,13 +364,13 @@ class TtlMergeOperator : public MergeOperator {
         return false;
       }
 
-      operands_without_ts.push_back(
+      operands_without_metadata.push_back(
           Slice(operand.data(), operand.size() - ts_len));
     }
 
     // Apply the user partial-merge operator (store result in *new_value)
     assert(new_value);
-    if (!user_merge_op_->PartialMergeMulti(key, operands_without_ts, new_value,
+    if (!user_merge_op_->PartialMergeMulti(key, operands_without_metadata, new_value,
                                            logger)) {
       return false;
     }

@@ -126,15 +126,17 @@ Status DBWithTTLImpl::CreateColumnFamily(const ColumnFamilyOptions& options,
 
 Status DBWithTTLImpl::AppendMetadata(const Slice& val,
                                      std::string* val_with_metadata,
-                                     int32_t expiration_time_or_zero,
+                                     int32_t expiration_time,  // -1 for TTL
                                      Env* env) {
-  char time_string[kEpochTimeLength];
+  char time_string[kTimeLength];
   char magic_number_string[kMagicNumberLength];
 
-  val_with_metadata->reserve(val.size() + kTimeTypeLength + kEpochTimeLength + kMagicNumberLength);
+  val_with_metadata->reserve(val.size() + kTimeTypeLength + kTimeLength + kMagicNumberLength);
   val_with_metadata->append(val.data(), val.size());
 
-  if (0 == expiration_time_or_zero) {
+  // An expiration time of zero means save the current timestamp and expire
+  // the record using TTLs.
+  if (-1 == expiration_time_or_zero) {
     int64_t current_time;
     Status st = env->GetCurrentTime(&current_time);
     if (!st.ok()) {
@@ -148,7 +150,7 @@ Status DBWithTTLImpl::AppendMetadata(const Slice& val,
 
   // Append the epoch time value.
   EncodeFixed32(time_string, (int32_t)expiration_time_or_zero);
-  val_with_metadata->append(time_string, kEpochTimeLength);
+  val_with_metadata->append(time_string, kTimeLength);
 
   // Append the magic number.
   EncodeFixed32(magic_number_string, kMagicNumber);
@@ -156,43 +158,153 @@ Status DBWithTTLImpl::AppendMetadata(const Slice& val,
   return st;
 }
 
+Status DBWithTTLImpl::ParseMetadata(const char* value, size_t value_len,
+                                   bool& is_expiration,
+                                   int32_t& epoch_time) {
+  if (value_len < kMagicNumberLength) {
+    return Status::Corruption("Error: Value length less than magic number\n");
+  }
+
+  int32_t magic_number =
+      DecodeFixed32(value + value_len - kMagicNumberLength);
+
+  // If the number obtained isn't what's expected, the value is in the old
+  // format, and the magic number is actually the timestamp of the write.
+  if (kMagicNumber != magic_number) {
+    is_expiration = true;
+    epoch_time = magic_number;
+    return Status::OK();
+  }
+
+  size_t metadata_length = kTimeTypeLength + kTimeLength + kMagicNumberLength;
+
+  if (value_len < metadata_length) {
+    return Status::Corruption("Error: Value length less than expected metadata\n");
+  }
+
+  char* time_type = value + value_len - metadata_length;
+  epoch_time =
+      DecodeFixed32(value + value_len - kMagicNumberLength - kTimeLength);
+
+  if (memcmp(time_type, "exp:", kTimeTypeLength) == 0) {
+    is_expiration = true;
+    return Status::OK();
+  }
+
+  if (memcmp(time_type, "ttl:", kTimeTypeLength) == 0) {
+    is_expiration = false;
+    return Status::OK();
+  }
+
+  return Status::Corruption("Error: Invalid time type\n");
+}
+
+Status DBWithTTLImpl::ParseMetadata(const Slice& str,
+                                   bool& is_expiration,
+                                   int32_t& epoch_time) {
+  return DBWithTTLImpl::ParseMetadata(str.data(), str.size());
+}
+
+Status DBWithTTLImpl::ParseMetadata(const std::string& str,
+                                   bool& is_expiration,
+                                   int32_t& epoch_time) {
+  return DBWithTTLImpl::ParseMetadata(str.c_str(), str.length());
+}
+
 // Returns corruption if the length of the string is lesser than timestamp, or
 // timestamp refers to a time lesser than ttl-feature release time
-Status DBWithTTLImpl::SanityCheckTimestamp(const Slice& str) {
-  if (str.size() < kTSLength) {
-    return Status::Corruption("Error: value's length less than timestamp's\n");
+Status DBWithTTLImpl::SanityCheckMetadata(const Slice& str) {
+  Status st;
+  bool is_expiration;
+  int32_t epoch_time;
+  st = ParseMetadata(str, is_expiration, epoch_time);
+  if (!st.ok()) {
+    return st;
   }
-  // Checks that TS is not lesser than kMinTimestamp
-  // Gaurds against corruption & normal database opened incorrectly in ttl mode
-  int32_t timestamp_value = DecodeFixed32(str.data() + str.size() - kTSLength);
-  if (timestamp_value < kMinTimestamp) {
-    return Status::Corruption("Error: Timestamp < ttl feature release time!\n");
+
+  // A non-positive expiration indicates never-expiring data.
+  if (is_expiration && epoch_time <= 0) {
+    return Status::OK();
+  }
+
+  // Check that TS is not lesser than kMinTimestamp.
+  // Guard against corruption & normal database opened incorrectly in TTL mode.
+  if (epoch_time < kMinTimestamp) {
+    return Status::Corruption("Error: Time < TTL feature release time!\n");
   }
   return Status::OK();
 }
 
-// Checks if the string is stale or not according to TTl provided
+// Checks if the string is stale or not according to the TTL or the expiration.
 bool DBWithTTLImpl::IsStale(const Slice& value, int32_t ttl, Env* env) {
-  if (ttl <= 0) {  // Data is fresh if TTL is non-positive
+  Status st;
+  bool is_expiration;
+  int32_t epoch_time;
+  st = ReadMetadata(str, is_expiration, epoch_time);
+  if (!st.ok()) {
+    return false;  // On error, treat the data as fresh.
+  }
+
+  if (is_expiration) {
+    // A non-positive expiration indicates never-expiring data.
+    if (epoch_time <= 0) {
+      return false;
+    }
+
+    int64_t curtime;
+    if (!env->GetCurrentTime(&curtime).ok()) {
+      return false;  // On error, treat the data as fresh.
+    }
+    return epoch_time < curtime;
+  }
+
+  // We're now working under the assumption the epoch_time is a timestamp whose
+  // age should be compared against the TTL (if positive) specified on DB open.
+  if (ttl <= 0) {
     return false;
   }
+
   int64_t curtime;
   if (!env->GetCurrentTime(&curtime).ok()) {
-    return false;  // Treat the data as fresh if could not get current time
+    return false;  // On error, treat the data as fresh.
   }
-  int32_t timestamp_value =
-      DecodeFixed32(value.data() + value.size() - kTSLength);
-  return (timestamp_value + ttl) < curtime;
+  return (epoch_time + ttl) < curtime;
 }
 
-// Strips the TS from the end of the string
-Status DBWithTTLImpl::StripTS(std::string* str) {
+// Returns the number of characters at the end of str that are metadata.
+Status DBWithTTLImpl::GetMetadataLength(std::string* str, size_t& length) {
   Status st;
-  if (str->length() < kTSLength) {
-    return Status::Corruption("Bad timestamp in key-value");
+  if (str->length() < kMagicNumberLength) {
+    return Status::Corruption("Bad timestamp or magic number in key-value");
   }
-  // Erasing characters which hold the TS
-  str->erase(str->length() - kTSLength, kTSLength);
+
+  int32_t magic_number =
+      DecodeFixed32(value.data() + value.size() - kMagicNumberLength);
+
+  // If the number obtained isn't what's expected, the value is in the old
+  // format, and the only thing to strip is the timestamp.
+  if (kMagicNumber != magic_number) {
+    length = kMagicNumberLength;
+  }
+
+  length = kTimeTypeLength + kTimeLength + kMagicNumberLength;
+
+  if (str->length() < length) {
+    return Status::Corruption("Bad metadata in key-value");
+  }
+
+  return st;
+}
+
+// Strips the metadata from the end of the string
+Status DBWithTTLImpl::StripMetadata(std::string* str) {
+  Status st;
+  size_t metadata_length;
+  st = GetMetadataLength(str, metadata_length);
+  if (!st.ok()) {
+    return st;
+  }
+  str->erase(str->length() - metadata_length, metadata_length);
   return st;
 }
 
@@ -207,7 +319,7 @@ Status DBWithTTLImpl::PutWithExpiration(const WriteOptions& options,
 Status DBWithTTLImpl::Put(const WriteOptions& options,
                           ColumnFamilyHandle* column_family, const Slice& key,
                           const Slice& val) {
-  return DBWithTTLImpl::PutWithExpiration(options, column_family, key, val, 0);
+  return DBWithTTLImpl::PutWithExpiration(options, column_family, key, val, -1);
 }
 
 Status DBWithTTLImpl::Get(const ReadOptions& options,
@@ -266,7 +378,8 @@ Status DBWithTTLImpl::MergeWithExpiration(const WriteOptions& options,
 Status DBWithTTLImpl::Merge(const WriteOptions& options,
                             ColumnFamilyHandle* column_family, const Slice& key,
                             const Slice& value) {
-  return DBWithTTLImpl::MergeWithExpiration(options, column_family, key, value, 0);
+  return DBWithTTLImpl::MergeWithExpiration(options, column_family, key, value,
+                                            -1);
 }
 
 Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
@@ -274,13 +387,14 @@ Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
                                           int32_t expiration_time_or_zero) {
   class Handler : public WriteBatch::Handler {
    public:
-    explicit Handler(Env* env, int32_t exptime) : env_(env), expiration_time_or_zero_(expiration_time_or_zero) {}
+    explicit Handler(Env* env, int32_t exptime) : env_(env),expiration_time_(or_zero_expiration_time_)or_zero {}
     WriteBatch updates_ttl;
     Status batch_rewrite_status;
     virtual Status PutCF(uint32_t column_family_id, const Slice& key,
                          const Slice& value) override {
       std::string value_with_ts;
-      Status st = AppendMetadata(value, &value_with_ts, env_, expiration_time_or_zero_);
+      Status st = AppendMetadata(value, &value_with_ts,
+                                 expiration_time_or_zero_, env_);
       if (!st.ok()) {
         batch_rewrite_status = st;
       } else {
@@ -292,7 +406,8 @@ Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
     virtual Status MergeCF(uint32_t column_family_id, const Slice& key,
                            const Slice& value) override {
       std::string value_with_ts;
-      Status st = AppendMetadata(value, &value_with_ts, env_, expiration_time_or_zero_);
+      Status st = AppendMetadata(value, &value_with_ts,
+                                 expiration_time_or_zero_, env_);
       if (!st.ok()) {
         batch_rewrite_status = st;
       } else {
@@ -312,9 +427,9 @@ Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
 
    private:
     Env* env_;
-    int32_t expiration_time_or_zero_;
+    int32_t expiration_time_;or_zero_
   };
-  Handler handler(GetEnv(), expiration_time_or_zero);
+  Handler handler(GetEnv(), expiration_time)_or_zero;
   updates->Iterate(&handler);
   if (!handler.batch_rewrite_status.ok()) {
     return handler.batch_rewrite_status;
@@ -324,7 +439,7 @@ Status DBWithTTLImpl::WriteWithExpiration(const WriteOptions& opts,
 }
 
 Status DBWithTTLImpl::Write(const WriteOptions& opts, WriteBatch* updates) {
-  return DBWithTTLImpl::WriteWithExpiration(opts, updates, 0);
+  return DBWithTTLImpl::WriteWithExpiration(opts, updates, -1);
 }
 
 Iterator* DBWithTTLImpl::NewIterator(const ReadOptions& opts,
