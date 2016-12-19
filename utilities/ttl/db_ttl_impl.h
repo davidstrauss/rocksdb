@@ -115,13 +115,13 @@ namespace rocksdb {
 
   static const uint32_t kTimeLength = sizeof(int32_t);
 
-  static const size_t kNewMetadataLen = kTimeTypeLength + kTimeLength + kMagicNumberLength;
-
   // The magic number uses the epoch time's string length to guarantee
   // compatibility with previous releases that only appended a timestamp. This
   // magic number is outside the valid range of allowed timestamps, so it is a
   // safe indicator that the value is in the new format.
   static const uint32_t kMagicNumberLength = kTimeLength;
+
+  static const size_t kNewMetadataLen = kTimeTypeLength + kTimeLength + kMagicNumberLength;
 
   static const int32_t kMagicNumber = 7904202;
 
@@ -167,7 +167,7 @@ class TtlIterator : public Iterator {
     Status st;
     size_t metadata_length;
     assert(DBWithTTLImpl::ParseMetadata(trimmed_value.data(), nullptr, nullptr,
-					&metadata_length).ok();
+					&metadata_length).ok());
     trimmed_value.size_ -= metadata_length;
     return trimmed_value;
   }
