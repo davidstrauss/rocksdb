@@ -3946,6 +3946,8 @@ SuperVersion* DBImpl::InstallSuperVersionAndScheduleWork(
                         old_sv->mutable_cf_options.max_write_buffer_number;
   }
 
+  Log(InfoLogLevel::INFO_LEVEL, immutable_db_options_.info_log, "Calling InstallSuperVersion()\n");
+
   auto* old = cfd->InstallSuperVersion(
       new_sv ? new_sv : new SuperVersion(), &mutex_, mutable_cf_options);
 

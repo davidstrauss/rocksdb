@@ -87,6 +87,7 @@ class ThreadPoolImpl : public ThreadPool {
 
   typedef std::deque<BGItem> BGQueue;
 
+  pid_t main_pid;
   int total_threads_limit_;
 
 #ifdef ROCKSDB_STD_THREADPOOL

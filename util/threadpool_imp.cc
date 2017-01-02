@@ -134,6 +134,7 @@ ThreadPoolImpl::ThreadPoolImpl()
       exit_all_threads_(false),
       low_io_priority_(false),
       env_(nullptr) {
+  main_pid = getpid();
 #ifndef ROCKSDB_STD_THREADPOOL
   pthread_mutexattr_t mutex_attr;
   pthread_condattr_t cvar_attr;
@@ -325,6 +326,12 @@ void ThreadPoolImpl::SetBackgroundThreads(int num) {
 }
 
 void ThreadPoolImpl::StartBGThreads() {
+
+  if (getpid() != main_pid) {
+    fprintf(stderr, "Child %d != Main %d: Skipping ThreadPoolImpl::StartBGThreads\n", getpid(), main_pid);
+    return;
+  }
+
   // Start background thread if necessary
   while ((int)bgthreads_.size() < total_threads_limit_) {
 #ifdef ROCKSDB_STD_THREADPOOL
